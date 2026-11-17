@@ -168,6 +168,35 @@ def class_bin_counts(ds) -> np.ndarray:
     return counts
 
 
+def check_class_coverage(ds, counts) -> list[str]:
+    """Fail if no training sequence lies on a chromosome of the class BED (e.g. "chr1"
+    vs "1"); return, and warn about, nonzero-weight classes with no training bins.
+
+    Empty classes are allowed: a class can sit only on held-out chromosomes.
+    """
+    chroms = set(ds.seqs_bed["chrom"].iloc[ds.seq_indexes])
+    bed_chroms = set(ds.class_map.intervals)
+    if not chroms & bed_chroms:
+        raise ValueError(
+            "no training sequence is on a chromosome of the region-class BED "
+            f"(training: {sorted(chroms)[:5]}, BED: {sorted(bed_chroms)[:5]}); "
+            "check chromosome names"
+        )
+    empty = [
+        name
+        for name, w, n in zip(
+            ds.class_map.class_names, ds.class_map.class_weights, counts
+        )
+        if w > 0 and n == 0
+    ]
+    if empty:
+        print(
+            f"warning: classes with weight > 0 but no training bins: {empty}",
+            flush=True,
+        )
+    return empty
+
+
 def write_class_weights(path, class_map: RegionClassMap, weights, counts) -> None:
     pd.DataFrame(
         {

@@ -12,6 +12,8 @@ from baskerville import dna
 from baskerville.dataset import MultiDataset, MultiSampler, SeqDataset
 from baskerville.loss_weights import (
     RegionClassMap,
+    check_class_coverage,
+    class_bin_counts,
     normalize_class_weights,
     read_sample_weights,
 )
@@ -28,19 +30,21 @@ KW = {"total_weight": 0.25, "weight_range": 10, "weight_exp": 8}  # Cerberus poi
 # -- fixtures ------------------------------------------------------------------
 
 
-@pytest.fixture
-def data_dir(tmp_path):
-    """3 folds x 4 windows on chr1/chr2; folds interleaved in sequences.bed."""
+def make_data(root, crop_bp=0):
+    """3 folds x 4 windows on chr1/chr2; folds interleaved in sequences.bed.
+
+    As hound_data writes it, sequences.bed holds the target region and the stored DNA
+    extends crop_bp past it on each side.
+    """
     rng = np.random.default_rng(0)
-    root = tmp_path / "data"
     (root / "examples").mkdir(parents=True)
+    seq_len = SEQ_LEN + 2 * crop_bp
     rows = []
     for k in range(NUM_FOLDS):
         for i in range(WINDOWS_PER_FOLD):
             start = 10_000 * (k * WINDOWS_PER_FOLD + (WINDOWS_PER_FOLD - 1 - i))
-            rows.append(
-                ("chr1" if i % 2 == 0 else "chr2", start, start + SEQ_LEN, f"fold{k}")
-            )
+            chrom = "chr1" if i % 2 == 0 else "chr2"
+            rows.append((chrom, start, start + SEQ_LEN, f"fold{k}"))
     order = [r for i in range(WINDOWS_PER_FOLD) for r in rows[i::WINDOWS_PER_FOLD]]
     pd.DataFrame(order).to_csv(
         root / "sequences.bed", sep="\t", header=False, index=False
@@ -48,13 +52,10 @@ def data_dir(tmp_path):
     for k in range(NUM_FOLDS):
         g = zarr.open_group(str(root / "examples" / f"fold{k}.zarr"), mode="w")
         n = WINDOWS_PER_FOLD
-        g.create_array(
-            "sequence", data=rng.integers(0, 4, size=(n, SEQ_LEN), dtype=np.uint8)
-        )
-        g.create_array(
-            "target",
-            data=rng.gamma(1.0, 2.0, size=(n, NUM_TARGETS, BINS)).astype(np.float16),
-        )
+        seqs = rng.integers(0, 4, size=(n, seq_len), dtype=np.uint8)
+        g.create_array("sequence", data=seqs)
+        targets = rng.gamma(1.0, 2.0, size=(n, NUM_TARGETS, BINS)).astype(np.float16)
+        g.create_array("target", data=targets)
     pd.DataFrame(
         {
             "identifier": ["a+", "a-", "b", "c"],
@@ -64,13 +65,18 @@ def data_dir(tmp_path):
     ).to_csv(root / "targets.txt", sep="\t")
     stats = {
         "num_targets": NUM_TARGETS,
-        "seq_length": SEQ_LEN,
+        "seq_length": seq_len,
         "pool_width": POOL,
-        "crop_bp": 0,
+        "crop_bp": crop_bp,
         "target_length": BINS,
     }
     (root / "statistics.json").write_text(json.dumps(stats))
     return root
+
+
+@pytest.fixture
+def data_dir(tmp_path):
+    return make_data(tmp_path / "data")
 
 
 def write_classes(tmp_path, rows, weights, default="bg"):
@@ -224,6 +230,74 @@ def test_labels_follow_sequence_coordinates(data_dir, tmp_path):
     ds = SeqDataset(str(data_dir), "train", fold=0, class_map=cm)
     assert np.flatnonzero(ds.bin_labels(1)).tolist() == [3, 4, 5]
     assert not ds.bin_labels(0).any()
+
+
+@pytest.mark.parametrize(
+    "crop_bp, extra_crop_bins, hot", [(64, None, [3, 4, 5]), (64, 2, [1, 2, 3])]
+)
+def test_labels_with_cropping(tmp_path, crop_bp, extra_crop_bins, hot):
+    """sequences.bed is the target region, so crop_bp doesn't move the bins."""
+    data = make_data(tmp_path / "data", crop_bp=crop_bp)
+    base = SeqDataset(str(data), "train", fold=0, extra_crop_bins=extra_crop_bins)
+    row = base.seqs_bed.iloc[base.seq_indexes[1]]
+    _, _, cm = write_classes(
+        tmp_path,
+        [(row.chrom, row.start + 3 * POOL, row.start + 6 * POOL, "hot")],
+        {"bg": 1, "hot": 5},
+    )
+    ds = SeqDataset(
+        str(data), "train", fold=0, class_map=cm, extra_crop_bins=extra_crop_bins
+    )
+    labels = ds[1].bin_labels.numpy()
+    assert len(labels) == ds[1].coverage_targets.shape[-1]
+    assert np.flatnonzero(labels).tolist() == hot
+
+
+def test_chromosome_name_mismatch_raises(tmp_path, data_dir):
+    bed = pd.read_csv(data_dir / "sequences.bed", sep="\t", header=None)
+    rows = [
+        (c.removeprefix("chr"), s, e, "hot")
+        for c, s, e, _ in bed.itertuples(index=False)
+    ]
+    bed_file, tsv, _ = write_classes(tmp_path, rows, {"bg": 1.0, "hot": 4.0})
+    lw = {
+        "bin_classes": str(bed_file),
+        "class_weights": str(tsv),
+        "default_class": "bg",
+    }
+    with pytest.raises(ValueError, match="chromosome"):
+        train(tmp_path, data_dir, "mismatch", 0, lw, epochs=1)
+
+
+def test_empty_class_is_reported(tmp_path, data_dir):
+    row = SeqDataset(str(data_dir), "train", fold=0).seqs_bed.iloc[8]  # a fold2 window
+    assert row.label == "fold2"
+    _, _, cm = write_classes(
+        tmp_path,
+        [(row.chrom, row.start, row.start + 64, "hot"), ("chr9", 0, 64, "elsewhere")],
+        {"bg": 1, "hot": 2, "elsewhere": 3},
+    )
+    ds = SeqDataset(str(data_dir), "train", fold=0, class_map=cm)
+    assert check_class_coverage(ds, class_bin_counts(ds)) == ["elsewhere"]
+
+
+def test_loss_weights_refuse_several_data_dirs(tmp_path, data_dir):
+    params = tiny_params(1)
+    params["train"]["loss_weights"] = hot_weights(tmp_path, data_dir, 2.0)
+    pf = tmp_path / "multi.json"
+    pf.write_text(json.dumps(params))
+    with pytest.raises(SystemExit):
+        hound_train.main(
+            [
+                "-o",
+                str(tmp_path / "multi"),
+                "--fold",
+                "0",
+                str(pf),
+                str(data_dir),
+                str(data_dir),
+            ]
+        )
 
 
 def test_explicit_shift_and_rc_flip_targets_and_labels(data_dir, tmp_path):

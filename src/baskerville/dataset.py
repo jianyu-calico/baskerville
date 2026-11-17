@@ -217,10 +217,9 @@ class SeqDataset(Dataset):
             )
         if self.class_map is not None and self.seq_indexes is None:
             raise ValueError(f"class_map needs {seqs_bed_file} matching the zarr files")
-        # first output bin starts this many bp after the sequence start
-        self.bin_offset = (
-            self.data_crop_bp + (self.extra_crop_bins or 0) * self.pool_width
-        )
+        # sequences.bed rows are the target region (hound_data already removed crop_bp),
+        # so only extra output cropping moves the first bin
+        self.bin_offset = (self.extra_crop_bins or 0) * self.pool_width
 
         # auto-detect gene data unless explicitly skipped
         self.has_genes = False
@@ -610,7 +609,6 @@ class SeqDatasetTeacher(Dataset):
         # count sequences
         zarr_seqs = [zd["sequence"].shape[0] for zd in zarr_data]
         self.zarr_cumseqs = np.append(0, np.cumsum(zarr_seqs))
-
         self.zarr_data = None
 
         # set all teacher models to eval mode
@@ -624,24 +622,9 @@ class SeqDatasetTeacher(Dataset):
     def __len__(self):
         return self.zarr_cumseqs[-1]
 
-    def bin_labels(self, idx: int) -> np.ndarray:
-        """Region-class id of each output bin of example ``idx`` (forward strand)."""
-        row = self.seqs_bed.iloc[self.seq_indexes[idx]]
-        return self.class_map.label_bins(
-            row.chrom,
-            int(row.start) + self.bin_offset,
-            self.target_length,
-            self.pool_width,
-        )
-
     def __getitem__(self, idx):
         if self.zarr_data is None:
             self._open_zarr()
-
-        # seeded samplers pass (idx, shift, rc) instead of drawing them here
-        aug = None
-        if isinstance(idx, tuple):
-            idx, *aug = idx
 
         # determine zarr indexes
         zi = np.searchsorted(self.zarr_cumseqs[1:], idx, side="right")

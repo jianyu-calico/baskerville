@@ -53,6 +53,10 @@ class BatchData:
             (B, seq_length). None if not loaded.
         repeat_mask: MLM-only. Per-position repeat mask, same shape as exon_mask.
             None if not loaded.
+        seq_index: Row of the example in sequences.bed, shape () or (B,). None
+            unless the dataset maps examples to sequences.bed.
+        bin_labels: Region-class id per output bin, shape (target_length,) or
+            (B, target_length), for loss weighting. None if not loaded.
     """
 
     sequence: torch.Tensor
@@ -63,6 +67,8 @@ class BatchData:
     species_label: Optional[torch.Tensor] = None
     exon_mask: Optional[torch.Tensor] = None
     repeat_mask: Optional[torch.Tensor] = None
+    seq_index: Optional[torch.Tensor] = None
+    bin_labels: Optional[torch.Tensor] = None
 
     @property
     def has_coverage(self) -> bool:
@@ -130,6 +136,16 @@ class BatchData:
             repeat_mask=(
                 torch.stack([b.repeat_mask for b in batch])
                 if batch[0].repeat_mask is not None
+                else None
+            ),
+            seq_index=(
+                torch.stack([b.seq_index for b in batch])
+                if batch[0].seq_index is not None
+                else None
+            ),
+            bin_labels=(
+                torch.stack([b.bin_labels for b in batch])
+                if batch[0].bin_labels is not None
                 else None
             ),
         )

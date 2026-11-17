@@ -16,10 +16,14 @@
 import argparse
 import json
 import os
+import random
 import shutil
+
+import numpy as np
 import torch  # needed due to numpy interaction
 
 from baskerville import dataset
+from baskerville import loss_weights
 from baskerville import seqnn
 from baskerville import trainer
 from baskerville.helpers import train_gcs
@@ -90,6 +94,21 @@ def main(argv=None):
     extra_crop_bp = params["train"].get("extra_crop_bp", None)
     extra_crop_bins = params["train"].get("extra_crop_bins", None)
 
+    # optional seed: model init here, data order/augmentation in the trainer
+    seed = params["train"].get("seed", None)
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+
+    # optional output-loss weights over region classes (see loss_weights.py)
+    lw = params["train"].get("loss_weights", {}) or {}
+    class_map = None
+    if lw.get("bin_classes"):
+        class_map = loss_weights.RegionClassMap.from_files(
+            lw["bin_classes"], lw["class_weights"], lw.get("default_class")
+        )
+
     # log fold assignment when in folds mode
     if args.fold is not None:
         splits = dataset.compute_fold_splits(num_folds, args.fold, args.cross)
@@ -116,6 +135,7 @@ def main(argv=None):
                     data_dir,
                     split_label="*",
                     mode="train",
+                    class_map=class_map,
                     extra_crop_bp=extra_crop_bp,
                     extra_crop_bins=extra_crop_bins,
                     fold=args.fold,
@@ -129,6 +149,7 @@ def main(argv=None):
                     data_dir,
                     split_label="train",
                     mode="train",
+                    class_map=class_map,
                     extra_crop_bp=extra_crop_bp,
                     extra_crop_bins=extra_crop_bins,
                     fold=args.fold,

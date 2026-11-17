@@ -97,7 +97,12 @@ class MultiDataset(Dataset):
     def __len__(self):
         return self.cumulative_lengths[-1]
 
-    def __getitem__(self, idx: int):
+    def __getitem__(self, idx):
+        # seeded samplers pass (idx, shift, rc); forward the augmentation choice
+        aug = None
+        if isinstance(idx, tuple):
+            idx, *aug = idx
+
         # find which dataset this index belongs to
         dataset_idx = 0
         while (
@@ -111,8 +116,9 @@ class MultiDataset(Dataset):
         if dataset_idx > 0:
             local_idx = idx - self.cumulative_lengths[dataset_idx - 1]
 
+        item = local_idx if aug is None else (local_idx, *aug)
         # Return the item and which dataset it came from (1-based index)
-        return dataset_idx, self.datasets[dataset_idx][local_idx]
+        return dataset_idx, self.datasets[dataset_idx][item]
 
 
 class SeqDataset(Dataset):
@@ -125,6 +131,8 @@ class SeqDataset(Dataset):
       targets_file (str): Targets table.
       extra_crop_bp (int): Optional input cropping in basepairs.
       extra_crop_bins (int): Optional output cropping in bins.
+      class_map (RegionClassMap): Optional region classes; items then carry
+        per-bin class ids (``bin_labels``) for loss weighting.
     """
 
     def __init__(
@@ -138,6 +146,7 @@ class SeqDataset(Dataset):
         skip_genes: bool = False,
         fold: int | None = None,
         cross: int = 0,
+        class_map=None,
     ):
         super().__init__()
         self.data_dir = data_dir
@@ -196,6 +205,23 @@ class SeqDataset(Dataset):
         zarr_seqs = [zd["sequence"].shape[0] for zd in zarr_data]
         self.zarr_cumseqs = np.append(0, np.cumsum(zarr_seqs))
 
+        # map examples to sequences.bed rows (row i of foldK.zarr is the i-th foldK row)
+        self.class_map = class_map
+        self.seqs_bed = None
+        self.seq_indexes = None
+        seqs_bed_file = Path(self.data_dir) / "sequences.bed"
+        if seqs_bed_file.exists():
+            self.seqs_bed = read_seqs_bed(seqs_bed_file)
+            self.seq_indexes = map_seq_indexes(
+                self.seqs_bed, self.zarr_files, zarr_seqs
+            )
+        if self.class_map is not None and self.seq_indexes is None:
+            raise ValueError(f"class_map needs {seqs_bed_file} matching the zarr files")
+        # first output bin starts this many bp after the sequence start
+        self.bin_offset = (
+            self.data_crop_bp + (self.extra_crop_bins or 0) * self.pool_width
+        )
+
         # auto-detect gene data unless explicitly skipped
         self.has_genes = False
         if not self.skip_genes:
@@ -223,9 +249,24 @@ class SeqDataset(Dataset):
     def __len__(self):
         return self.zarr_cumseqs[-1]
 
+    def bin_labels(self, idx: int) -> np.ndarray:
+        """Region-class id of each output bin of example ``idx`` (forward strand)."""
+        row = self.seqs_bed.iloc[self.seq_indexes[idx]]
+        return self.class_map.label_bins(
+            row.chrom,
+            int(row.start) + self.bin_offset,
+            self.target_length,
+            self.pool_width,
+        )
+
     def __getitem__(self, idx):
         if self.zarr_data is None:
             self._open_zarr()
+
+        # seeded samplers pass (idx, shift, rc) instead of drawing them here
+        aug = None
+        if isinstance(idx, tuple):
+            idx, *aug = idx
 
         # determine zarr indexes
         zi = np.searchsorted(self.zarr_cumseqs[1:], idx, side="right")
@@ -273,20 +314,30 @@ class SeqDataset(Dataset):
             gene_presence = torch.from_numpy(gene_presence)
             gene_out_mask = torch.from_numpy(gene_out_mask)
 
+        bin_labels = None
+        if self.class_map is not None:
+            bin_labels = torch.from_numpy(self.bin_labels(idx))
+
         # stochastic augmentations
         if self.mode == "train":
+            if aug is None:
+                shift = np.random.choice(np.arange(-1, 2))
+                ex_rc = np.random.choice([True, False])
+            else:
+                shift, ex_rc = aug
+
             # shift
-            shift = np.random.choice(np.arange(-1, 2))
             seq_indexes = dna.seqi_shift(seq_indexes, shift, self.seq_depth)
 
             # reverse complement
-            ex_rc = np.random.choice([True, False])
             if ex_rc:
                 seq_indexes = dna.seqi_rc(seq_indexes)
                 if self.has_coverage:
                     targets = torch.flip(targets[self.strand_pair], [1])
                 if self.has_genes:
                     gene_out_mask = torch.flip(gene_out_mask, [-1])
+                if bin_labels is not None:
+                    bin_labels = torch.flip(bin_labels, [0])
 
         # sequence to 1-hot torch
         seq_1hot = np.zeros((self.seq_depth + 1, self.seq_length), dtype="bool")
@@ -299,7 +350,37 @@ class SeqDataset(Dataset):
             gene_targets=gene_targets if self.has_genes else None,
             gene_presence=gene_presence if self.has_genes else None,
             gene_out_mask=gene_out_mask if self.has_genes else None,
+            seq_index=(
+                torch.tensor(self.seq_indexes[idx])
+                if self.seq_indexes is not None
+                else None
+            ),
+            bin_labels=bin_labels,
         )
+
+
+def read_seqs_bed(path) -> pd.DataFrame:
+    """sequences.bed as chrom, start, end, label; the row number is the sequence index."""
+    return pd.read_csv(
+        path,
+        sep="\t",
+        header=None,
+        usecols=[0, 1, 2, 3],
+        names=["chrom", "start", "end", "label"],
+        dtype={"chrom": str, "label": str},
+    )
+
+
+def map_seq_indexes(seqs_bed: pd.DataFrame, zarr_files, zarr_seqs) -> np.ndarray | None:
+    """sequences.bed row of each example across ``zarr_files``, or None if they disagree."""
+    labels = seqs_bed["label"].to_numpy()
+    rows = []
+    for zf, n in zip(zarr_files, zarr_seqs):
+        r = np.flatnonzero(labels == Path(zf).name.removesuffix(".zarr"))
+        if len(r) != n:
+            return None
+        rows.append(r)
+    return np.concatenate(rows) if rows else np.zeros(0, dtype=np.int64)
 
 
 class SeqDatasetMLM(Dataset):
@@ -529,6 +610,7 @@ class SeqDatasetTeacher(Dataset):
         # count sequences
         zarr_seqs = [zd["sequence"].shape[0] for zd in zarr_data]
         self.zarr_cumseqs = np.append(0, np.cumsum(zarr_seqs))
+
         self.zarr_data = None
 
         # set all teacher models to eval mode
@@ -542,9 +624,24 @@ class SeqDatasetTeacher(Dataset):
     def __len__(self):
         return self.zarr_cumseqs[-1]
 
+    def bin_labels(self, idx: int) -> np.ndarray:
+        """Region-class id of each output bin of example ``idx`` (forward strand)."""
+        row = self.seqs_bed.iloc[self.seq_indexes[idx]]
+        return self.class_map.label_bins(
+            row.chrom,
+            int(row.start) + self.bin_offset,
+            self.target_length,
+            self.pool_width,
+        )
+
     def __getitem__(self, idx):
         if self.zarr_data is None:
             self._open_zarr()
+
+        # seeded samplers pass (idx, shift, rc) instead of drawing them here
+        aug = None
+        if isinstance(idx, tuple):
+            idx, *aug = idx
 
         # determine zarr indexes
         zi = np.searchsorted(self.zarr_cumseqs[1:], idx, side="right")
@@ -634,15 +731,30 @@ class SeqDatasetTeacher(Dataset):
 
 
 class MultiSampler(Sampler):
-    """Sampler to ensure that batches are drawn from the same dataset."""
+    """Sampler to ensure that batches are drawn from the same dataset.
 
-    def __init__(self, multi_dataset, batch_size, upsampling_rates=None, mode="train"):
+    With ``seed`` set, shuffling and each example's (shift, rc) augmentation are
+    drawn here from ``default_rng([seed, epoch])`` (call ``set_epoch``), and
+    batches hold ``(idx, shift, rc)`` items. Every pass within an epoch repeats
+    the same order (DataLoader may call ``iter`` more than once), so data order
+    depends only on the seed and epoch, not on workers or resuming. Without
+    ``seed``, the global numpy RNG is used as before.
+    """
+
+    def __init__(
+        self, multi_dataset, batch_size, upsampling_rates=None, mode="train", seed=None
+    ):
         self.multi_dataset = multi_dataset
         self.batch_size = batch_size
         self.upsampling_rates = upsampling_rates
         if self.upsampling_rates is None:
             self.upsampling_rates = [1 for _ in range(len(self.multi_dataset.datasets))]
         self.mode = mode
+        self.seed = seed
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
 
     def __len__(self):
         return sum(
@@ -655,6 +767,8 @@ class MultiSampler(Sampler):
         )
 
     def __iter__(self):
+        if self.seed is not None:
+            return self._iter_seeded(np.random.default_rng([self.seed, self.epoch]))
         batch_indices = []
         examples_start = 0
         for di, [dataset, upsampling_rate] in enumerate(
@@ -692,6 +806,36 @@ class MultiSampler(Sampler):
             np.random.shuffle(batch_indices)
 
         return iter(batch_indices)
+
+    def _iter_seeded(self, rng):
+        train = self.mode == "train"
+        batches = []
+        start = 0
+        for dataset, rate in zip(self.multi_dataset.datasets, self.upsampling_rates):
+            n = len(dataset)
+            n_batched = n - n % self.batch_size
+            for _ in range(rate):
+                order = start + (rng.permutation(n) if train else np.arange(n))
+                order = order[:n_batched]
+                batches += [
+                    order[i : i + self.batch_size]
+                    for i in range(0, n_batched, self.batch_size)
+                ]
+            start += n
+        if train:
+            batches = [batches[i] for i in rng.permutation(len(batches))]
+        for batch in batches:
+            shifts = (
+                rng.integers(-1, 2, size=len(batch))
+                if train
+                else np.zeros(len(batch), int)
+            )
+            rcs = (
+                rng.integers(0, 2, size=len(batch))
+                if train
+                else np.zeros(len(batch), int)
+            )
+            yield [(int(i), int(s), bool(r)) for i, s, r in zip(batch, shifts, rcs)]
 
 
 def make_strand_transform(targets_df, targets_strand_df):

@@ -448,17 +448,30 @@ class PoissonMultinomialLoss(_Loss):
             self.register_buffer("position_weights", weights)
             self.register_buffer("weights_sum", weights.sum())
 
-    def forward(self, y_pred, y_true, target_weights=None):
+    def forward(
+        self, y_pred, y_true, target_weights=None, bin_weights=None, sample_weights=None
+    ):
         """Args:
         y_pred, y_true: B x T x L predictions and targets.
         target_weights: optional (1, T) per-track loss weights.
+        bin_weights: optional B x L or B x T x L output-bin weights, multiplied
+          into the position weights (flipped with the targets under RC).
+        sample_weights: optional (B,) per-sequence weights.
+
+        Both weightings keep fixed normalizers (weights_sum, the B x T mean), so
+        callers scale them to mean 1 over the training set.
         """
         seq_len = y_true.shape[2]
         self._setup_position_weights(seq_len, y_true.device)
 
-        # apply position weights
-        y_true = y_true * self.position_weights
-        y_pred = y_pred * self.position_weights
+        # apply position (and optional bin) weights
+        weights = self.position_weights
+        if bin_weights is not None:
+            if bin_weights.dim() == 2:
+                bin_weights = bin_weights.unsqueeze(1)
+            weights = weights * bin_weights.float()
+        y_true = y_true * weights
+        y_pred = y_pred * weights
 
         # sum across lengths
         s_true = y_true.sum(dim=-1)  # B x T
@@ -485,6 +498,9 @@ class PoissonMultinomialLoss(_Loss):
             loss = loss_raw * 2 / (1 + self.total_weight)
         else:
             loss = loss_raw
+
+        if sample_weights is not None:
+            loss = loss * sample_weights.to(loss.dtype).unsqueeze(1)
 
         return weighted_reduce(loss, target_weights, self.reduction)
 

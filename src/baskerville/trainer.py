@@ -13,6 +13,7 @@ from torch.optim.lr_scheduler import LambdaLR, LinearLR, SequentialLR
 from schedulefree import AdamWScheduleFree
 
 from baskerville import dataset
+from baskerville import loss_weights
 from baskerville import metrics
 from baskerville.types import BatchData, ModelOutput
 
@@ -79,6 +80,15 @@ class Trainer:
       out_dir (str): Output directory name.
     """
 
+    # loss-weighting state (set in _setup_loss_weights); class defaults keep
+    # partially constructed trainers (tests) working
+    hook = None
+    class_weights: list = []
+    sample_weights: list = []
+    _epoch = 0
+    _step = 0
+    _last_step = None
+
     def __init__(
         self,
         params: dict,
@@ -88,6 +98,7 @@ class Trainer:
         model_heads=None,
         checkpoint_callback=None,
         prune_callback=None,
+        hook=None,
     ):
         self.params = params
         self.train_data = train_data
@@ -135,11 +146,14 @@ class Trainer:
         self.num_datasets = len(self.train_data)
         train_multidata = dataset.MultiDataset(self.train_data)
 
-        train_sampler = dataset.MultiSampler(
+        # seeds data order and augmentation (model init is seeded by the caller)
+        self.seed = self.params.get("seed", None)
+        self.train_sampler = train_sampler = dataset.MultiSampler(
             train_multidata,
             batch_size=self.batch_size,
             upsampling_rates=upsampling_rates,
             mode="train",
+            seed=self.seed,
         )
 
         # Use custom collate function
@@ -303,6 +317,61 @@ class Trainer:
             # RC augmentation is handled in SeqDatasetMLM.__getitem__, not here,
             # to avoid double-augmenting.
 
+        self._setup_loss_weights(hook)
+
+    def _setup_loss_weights(self, hook):
+        """Per-dataset class (bin) and sample weights, normalized to mean 1 over training.
+
+        ``class_weights[di]`` is a device tensor indexed by a batch's ``bin_labels``;
+        ``sample_weights[di]`` is indexed by ``seq_index``. An online-reweighting
+        ``hook`` may edit them in place (see ``loss_weights.StepInfo``).
+        """
+        config = self.params.get("loss_weights", {}) or {}
+        self.hook = (
+            hook if hook is not None else loss_weights.load_hook(config.get("hook"))
+        )
+        self.class_weights, self.sample_weights = [], []
+        for di, ds in enumerate(self.train_data):
+            cw = sw = None
+            if getattr(ds, "class_map", None) is not None:
+                counts = loss_weights.class_bin_counts(ds)
+                w = loss_weights.normalize_class_weights(
+                    ds.class_map.class_weights, counts
+                )
+                loss_weights.write_class_weights(
+                    f"{self.out_dir}/class_weights_ds{di}.tsv", ds.class_map, w, counts
+                )
+                cw = torch.tensor(w, dtype=torch.float32, device=self.device)
+            if config.get("sample_weights"):
+                raw = loss_weights.read_sample_weights(
+                    config["sample_weights"], ds.seqs_bed
+                )
+                w = loss_weights.normalize_sample_weights(raw, ds.seq_indexes)
+                sw = torch.tensor(w, dtype=torch.float32, device=self.device)
+            self.class_weights.append(cw)
+            self.sample_weights.append(sw)
+        weighted = any(w is not None for w in self.class_weights + self.sample_weights)
+        if weighted and self.loss != "poisson_mn":
+            raise ValueError(f"loss weights need the poisson_mn loss, not {self.loss}")
+        self._epoch = self._step = 0
+        self._last_step = None
+
+    def _batch_loss_weights(self, di, batch_data):
+        """(bin_labels, bin_weights, sample_weights) on the device; None where unset."""
+        if not hasattr(batch_data, "bin_labels"):  # legacy tuple batches
+            return None, None, None
+        labels = bin_w = sample_w = None
+        if self.class_weights[di] is not None:
+            labels = batch_data.bin_labels.to(self.device, non_blocking=True).long()
+            bin_w = self.class_weights[di][labels]
+        if self.sample_weights[di] is not None:
+            seq_index = batch_data.seq_index.to(self.device, non_blocking=True)
+            sample_w = self.sample_weights[di][seq_index]
+        return labels, bin_w, sample_w
+
+    def _weights_state_file(self):
+        return f"{self.out_dir}/loss_weights_state.pt"
+
     def _setup_target_weights(self, gene: bool = False):
         """Per-dataset (1, T) loss weight tensors, or None where every weight is 1.
 
@@ -365,12 +434,23 @@ class Trainer:
         gene_presence: torch.Tensor | None,
         species_weight: torch.Tensor,
         di: int,
+        bin_weights: torch.Tensor | None = None,
+        sample_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compute combined loss from model output."""
         loss = torch.tensor(0.0, device=self.device)
 
         if yh.has_coverage and y is not None:
-            cov_loss = self.loss_fn(yh.coverage, y, self.target_weights[di])
+            if bin_weights is None and sample_weights is None:
+                cov_loss = self.loss_fn(yh.coverage, y, self.target_weights[di])
+            else:
+                cov_loss = self.loss_fn(
+                    yh.coverage,
+                    y,
+                    self.target_weights[di],
+                    bin_weights=bin_weights,
+                    sample_weights=sample_weights,
+                )
             loss = loss + cov_loss * species_weight
 
         if yh.has_gene and yg is not None:
@@ -649,6 +729,14 @@ class Trainer:
             valid_best = checkpoint["valid_best"]
             epoch_start = checkpoint["epoch"]
             unimproved = 0 if self.reset_unimproved else checkpoint["unimproved"]
+
+        # restore online-updated loss weights, or let the hook initialize them
+        if epoch_start > 0 and os.path.exists(self._weights_state_file()):
+            state = torch.load(self._weights_state_file(), map_location=self.device)
+            self.class_weights = state["class_weights"]
+            self.sample_weights = state["sample_weights"]
+        elif self.hook is not None and hasattr(self.hook, "on_train_start"):
+            self.hook.on_train_start(self)
         return epoch_start, valid_best, unimproved
 
     def _log_epoch_cov(self, log_out, ei, n_eval_datasets):
@@ -972,6 +1060,10 @@ class Trainer:
             self.optimizer.step()
         if self.schedule != "free":
             self.scheduler.step()
+        self._step += 1
+        if self._last_step is not None:
+            self.hook.after_step(self, self._last_step)
+            self._last_step = None
 
     def _partition_weight_decay_groups(self, named_params):
         """Partition model parameters into sets depending on weight decay rules.
@@ -1174,6 +1266,7 @@ class Trainer:
             device=self.device, dtype=torch.float32
         )
         hi = di if self.model_heads is None else self.model_heads
+        labels, bin_w, sample_w = self._batch_loss_weights(di, batch_data)
 
         with torch.autocast(device_type=self.device, dtype=self.mix_dtype):
             yh = self.model(
@@ -1183,7 +1276,19 @@ class Trainer:
                 gene_out_mask=gene_out_mask,
                 gene_presence=gene_presence,
             )
-            loss = self._compute_loss(yh, y, yg, gene_presence, sw, di)
+            loss = self._compute_loss(yh, y, yg, gene_presence, sw, di, bin_w, sample_w)
+
+        if self.hook is not None and hasattr(self.hook, "after_step"):
+            self._last_step = loss_weights.StepInfo(
+                epoch=self._epoch,
+                step=self._step,
+                di=di,
+                seq_index=getattr(batch_data, "seq_index", None),
+                bin_labels=labels,
+                y_pred=yh.coverage.detach() if yh.has_coverage else None,
+                y_true=y,
+                loss=float(loss.detach()),
+            )
 
         if not score:
             y = None
@@ -1214,6 +1319,21 @@ class Trainer:
 
     def _train_epoch(self, ei):
         """Run one training epoch over ``train_dataload``."""
+        self._epoch = ei
+        self.train_sampler.set_epoch(ei)
+        self._train_epoch_batches(ei)
+        if self.hook is not None and hasattr(self.hook, "on_epoch_end"):
+            self.hook.on_epoch_end(self, ei)
+        if any(w is not None for w in self.class_weights + self.sample_weights):
+            torch.save(
+                {
+                    "class_weights": self.class_weights,
+                    "sample_weights": self.sample_weights,
+                },
+                self._weights_state_file(),
+            )
+
+    def _train_epoch_batches(self, ei):
         train_batch_i = 0
         dataset_batches = [0] * self.num_datasets
         t0 = time.time()

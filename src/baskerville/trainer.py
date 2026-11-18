@@ -335,6 +335,7 @@ class Trainer:
             cw = sw = None
             if getattr(ds, "class_map", None) is not None:
                 counts = loss_weights.class_bin_counts(ds)
+                loss_weights.check_class_coverage(ds, counts)
                 w = loss_weights.normalize_class_weights(
                     ds.class_map.class_weights, counts
                 )

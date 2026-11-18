@@ -103,6 +103,9 @@ def main(argv=None):
 
     # optional output-loss weights over region classes (see loss_weights.py)
     lw = params["train"].get("loss_weights", {}) or {}
+    if (lw.get("bin_classes") or lw.get("sample_weights")) and len(args.data_dirs) > 1:
+        # one region-class BED / sequence-weight table is keyed to one genome's windows
+        parser.error("loss_weights support a single data directory")
     class_map = None
     if lw.get("bin_classes"):
         class_map = loss_weights.RegionClassMap.from_files(

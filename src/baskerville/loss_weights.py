@@ -57,6 +57,10 @@ class RegionClassMap:
         class_weights: str | Path,
         default_class: str | None = None,
     ) -> RegionClassMap:
+        with open(class_weights) as f:
+            header = f.readline().rstrip("\n").split("\t")
+        if len(set(header)) != len(header):
+            raise ValueError(f"{class_weights}: duplicate columns in {header}")
         table = pd.read_csv(class_weights, sep="\t", dtype={"class": str})
         if table.columns[0] != "class" or len(table.columns) < 2:
             raise ValueError(
@@ -118,11 +122,24 @@ class RegionClassMap:
     def num_groups(self) -> int:
         return len(self.group_names)
 
+    @property
+    def shared(self) -> bool:
+        """A plain ``class weight`` table: one weight per class for every track."""
+        return self.group_names == [None]
+
     def track_groups(
-        self, targets_df: pd.DataFrame, group_by: str = "assay", group_map=None
+        self,
+        targets_df: pd.DataFrame,
+        group_by: str = "assay",
+        group_map=None,
+        strand_pair=None,
     ) -> np.ndarray:
-        """Group index (into ``group_names``) of each track; all 0 for a shared table."""
-        if self.group_names == [None]:
+        """Group index (into ``group_names``) of each track; all 0 for a shared table.
+
+        A table with group columns, even a single one, must name every track's group;
+        strand partners (``strand_pair``, positional) must share a group.
+        """
+        if self.shared:
             return np.zeros(len(targets_df), dtype=np.int64)
         if group_by not in targets_df.columns:
             raise ValueError(
@@ -135,7 +152,17 @@ class RegionClassMap:
         missing = sorted(set(groups) - set(index))
         if missing:
             raise ValueError(f"track groups without a class-weight column: {missing}")
-        return groups.map(index).to_numpy(dtype=np.int64)
+        unused = sorted(set(index) - set(groups))
+        if unused:
+            print(f"warning: class-weight columns with no tracks: {unused}", flush=True)
+        group_index = groups.map(index).to_numpy(dtype=np.int64)
+        if strand_pair is not None:
+            split = np.flatnonzero(group_index != group_index[np.asarray(strand_pair)])
+            if len(split):
+                raise ValueError(
+                    f"strand partners in different groups: tracks {split[:10].tolist()}"
+                )
+        return group_index
 
     @property
     def num_classes(self) -> int:
@@ -210,43 +237,103 @@ def class_bin_counts(ds) -> np.ndarray:
     return counts
 
 
-def check_class_coverage(ds, counts) -> list[str]:
-    """Fail if no training sequence lies on a chromosome of the class BED (e.g. "chr1"
-    vs "1"); return, and warn about, nonzero-weight classes with no training bins.
+def split_of_rows(ds) -> np.ndarray:
+    """ "train", "valid", "test" (or "held_out" outside folds mode) per sequences.bed row."""
+    split = np.full(len(ds.seqs_bed), "held_out", dtype=object)
+    labels = ds.seqs_bed["label"].to_numpy()
+    if ds.fold is not None:
+        from baskerville.dataset import compute_fold_splits  # noqa: PLC0415
 
-    Empty classes are allowed: a class can sit only on held-out chromosomes.
+        num_folds = len({lab for lab in labels if str(lab).startswith("fold")})
+        folds = compute_fold_splits(num_folds, ds.fold, ds.cross)
+        split[labels == f"fold{folds['valid']}"] = "valid"
+        split[labels == f"fold{folds['test']}"] = "test"
+    split[ds.seq_indexes] = "train"
+    return split
+
+
+def class_bin_counts_by_split(ds) -> dict[str, np.ndarray]:
+    """Output bins per class over every sequences.bed window, by split.
+
+    ``["train"]`` equals ``class_bin_counts(ds)`` (the normalization counts); valid and
+    test windows are only counted, to catch labelling errors.
     """
-    chroms = set(ds.seqs_bed["chrom"].iloc[ds.seq_indexes])
-    bed_chroms = set(ds.class_map.intervals)
-    if not chroms & bed_chroms:
+    cm = ds.class_map
+    split = split_of_rows(ds)
+    counts = {s: np.zeros(cm.num_classes, dtype=np.int64) for s in np.unique(split)}
+    for row, s in zip(ds.seqs_bed.itertuples(index=False), split):
+        labels = cm.label_bins(
+            row.chrom, int(row.start) + ds.bin_offset, ds.target_length, ds.pool_width
+        )
+        counts[s] += np.bincount(labels, minlength=cm.num_classes)
+    counts.setdefault("train", np.zeros(cm.num_classes, dtype=np.int64))
+    return counts
+
+
+def check_class_coverage(ds, counts_by_split: dict[str, np.ndarray]) -> list[str]:
+    """Raise on labelling errors; return, and warn about, held-out-only classes.
+
+    - Raise if no chromosome name is shared between sequences.bed and the class BED.
+    - Raise if a class with weight > 0 has no bins in any sequences.bed window (a class
+      missing from the BED, misnamed chromosomes, intervals that never hold a 32 bp
+      bin midpoint).
+    - Warn if such a class has bins only in valid/test windows (allowed: a class can
+      sit on held-out chromosomes), about BED chromosomes absent from sequences.bed,
+      and about intervals shorter than a bin.
+    """
+    cm = ds.class_map
+    seq_chroms = set(ds.seqs_bed["chrom"])
+    bed_chroms = set(cm.intervals)
+    if not seq_chroms & bed_chroms:
         raise ValueError(
-            "no training sequence is on a chromosome of the region-class BED "
-            f"(training: {sorted(chroms)[:5]}, BED: {sorted(bed_chroms)[:5]}); "
+            "no sequences.bed chromosome is in the region-class BED "
+            f"(sequences: {sorted(seq_chroms)[:5]}, BED: {sorted(bed_chroms)[:5]}); "
             "check chromosome names"
         )
-    empty = [
-        name
-        for name, w, n in zip(
-            ds.class_map.class_names, ds.class_map.class_weights.max(axis=1), counts
-        )
-        if w > 0 and n == 0
-    ]
-    if empty:
+    absent = sorted(bed_chroms - seq_chroms)
+    if absent:
+        print(f"warning: class BED chromosomes not in sequences.bed: {absent[:20]}")
+    short = sum(
+        int(((e - s) < ds.pool_width).sum()) for s, e, _ in cm.intervals.values()
+    )
+    if short:
         print(
-            f"warning: classes with weight > 0 but no training bins: {empty}",
-            flush=True,
+            f"warning: {short} class intervals are shorter than a {ds.pool_width} bp bin"
         )
-    return empty
+
+    weighted = cm.class_weights.max(axis=1) > 0
+    total = sum(counts_by_split.values())
+    train = counts_by_split["train"]
+    missing = [n for n, w, c in zip(cm.class_names, weighted, total) if w and c == 0]
+    if missing:
+        raise ValueError(
+            f"classes with weight > 0 but no bins in any sequences.bed window: {missing}"
+        )
+    held_out = [
+        n
+        for n, w, c, t in zip(cm.class_names, weighted, total, train)
+        if w and c and not t
+    ]
+    if held_out:
+        print(
+            f"warning: classes with weight > 0 only in valid/test windows: {held_out}"
+        )
+    return held_out
 
 
-def write_class_weights(path, class_map: RegionClassMap, weights, counts) -> None:
-    """Raw and normalized weights per class (columns per group for a per-group table)."""
+def write_class_weights(
+    path, class_map: RegionClassMap, weights, counts_by_split
+) -> None:
+    """Raw and normalized weights per class (columns per group for a per-group table)
+    and bin counts per split, so partial labelling losses are visible."""
     table = {"class": class_map.class_names}
     for gi, g in enumerate(class_map.group_names):
         suffix = "" if g is None else f"_{g}"
         table[f"weight_raw{suffix}"] = class_map.class_weights[:, gi]
         table[f"weight{suffix}"] = weights[:, gi]
-    table["train_bins"] = counts
+    for split in ("train", "valid", "test", "held_out"):
+        if split in counts_by_split:
+            table[f"{split}_bins"] = counts_by_split[split]
     pd.DataFrame(table).to_csv(path, sep="\t", index=False)
 
 

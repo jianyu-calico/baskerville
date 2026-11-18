@@ -14,6 +14,7 @@ from baskerville.loss_weights import (
     RegionClassMap,
     check_class_coverage,
     class_bin_counts,
+    class_bin_counts_by_split,
     normalize_class_weights,
     read_sample_weights,
 )
@@ -274,16 +275,59 @@ def test_chromosome_name_mismatch_raises(tmp_path, data_dir):
         train(tmp_path, data_dir, "mismatch", 0, lw, epochs=1)
 
 
-def test_empty_class_is_reported(tmp_path, data_dir):
-    row = SeqDataset(str(data_dir), "train", fold=0).seqs_bed.iloc[8]  # a fold2 window
-    assert row.label == "fold2"
+def window(data_dir, label):
+    """The first sequences.bed row of a fold (fold0 test, fold1 valid, fold2 train)."""
+    bed = SeqDataset(str(data_dir), "train", fold=0).seqs_bed
+    return bed[bed.label == label].iloc[0]
+
+
+def test_heldout_only_class_warns_and_counts_by_split(tmp_path, data_dir, capsys):
+    tr, te = window(data_dir, "fold2"), window(data_dir, "fold0")
     _, _, cm = write_classes(
         tmp_path,
-        [(row.chrom, row.start, row.start + 64, "hot"), ("chr9", 0, 64, "elsewhere")],
-        {"bg": 1, "hot": 2, "elsewhere": 3},
+        [
+            (tr.chrom, tr.start, tr.start + 64, "hot"),
+            (te.chrom, te.start, te.start + 96, "test_only"),
+        ],
+        {"bg": 1, "hot": 2, "test_only": 3},
     )
     ds = SeqDataset(str(data_dir), "train", fold=0, class_map=cm)
-    assert check_class_coverage(ds, class_bin_counts(ds)) == ["elsewhere"]
+    by_split = class_bin_counts_by_split(ds)
+    assert np.array_equal(by_split["train"], class_bin_counts(ds))
+    assert by_split["train"].tolist()[1:] == [2, 0]
+    assert by_split["test"].tolist()[1:] == [0, 3]
+    assert by_split["valid"].tolist()[1:] == [0, 0]
+    assert check_class_coverage(ds, by_split) == ["test_only"]
+    assert "only in valid/test" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("case", ["missing_from_bed", "short_intervals", "misnamed"])
+def test_weighted_class_without_bins_anywhere_raises(tmp_path, data_dir, case):
+    tr = window(data_dir, "fold2")
+    rows = [(tr.chrom, tr.start, tr.start + 64, "hot")]
+    if case == "short_intervals":  # 10 bp, never holding a bin midpoint (offset 16)
+        rows.append((tr.chrom, tr.start + 64, tr.start + 74, "lost"))
+    if case == "misnamed":
+        rows.append((tr.chrom.removeprefix("chr"), tr.start, tr.start + 64, "lost"))
+    _, _, cm = write_classes(tmp_path, rows, {"bg": 1, "hot": 2, "lost": 3})
+    ds = SeqDataset(str(data_dir), "train", fold=0, class_map=cm)
+    with pytest.raises(ValueError, match="no bins in any"):
+        check_class_coverage(ds, class_bin_counts_by_split(ds))
+
+
+def test_partly_misnamed_class_is_visible(tmp_path, data_dir, capsys):
+    """Half the intervals on '1' instead of 'chr1': warned, and visible in the counts."""
+    bed = SeqDataset(str(data_dir), "train", fold=0).seqs_bed
+    rows = [
+        (c if i % 2 else c.removeprefix("chr"), s0, s0 + 64, "hot")
+        for i, (c, s0) in enumerate(zip(bed.chrom, bed.start))
+    ]
+    _, _, cm = write_classes(tmp_path, rows, {"bg": 1, "hot": 2})
+    ds = SeqDataset(str(data_dir), "train", fold=0, class_map=cm)
+    by_split = class_bin_counts_by_split(ds)
+    check_class_coverage(ds, by_split)
+    assert "not in sequences.bed" in capsys.readouterr().out
+    assert sum(by_split.values())[1] == 2 * len(bed) // 2  # half the windows lost
 
 
 def test_loss_weights_refuse_several_data_dirs(tmp_path, data_dir):
@@ -651,3 +695,50 @@ def test_all_ones_group_table_equals_unweighted_training(tmp_path, data_dir):
     for g in ("rna", "dnase", "chip"):  # mean 1 within each group
         mean = (w[f"weight_{g}"] * w.train_bins).sum() / w.train_bins.sum()
         assert abs(mean - 1) < 1e-9
+
+
+def test_single_group_column_is_validated(tmp_path, data_dir):
+    """A table with one group column is per-group, not shared: every track needs it."""
+    table = {"bg": {"dnase": 1}, "hot": {"dnase": 3}}
+    bed, tsv, cm = group_class_map(tmp_path, data_dir, table)
+    assert not cm.shared and cm.num_groups == 1
+    targets = SeqDataset(str(data_dir), "train", fold=0).targets_df
+    with pytest.raises(ValueError, match="without a class-weight column"):
+        cm.track_groups(targets)
+    lw = {"bin_classes": str(bed), "class_weights": str(tsv), "default_class": "bg"}
+    with pytest.raises(ValueError, match="without a class-weight column"):
+        train(tmp_path, data_dir, "one_group", 0, lw, epochs=1)
+    # mapping every assay into that group makes it valid
+    lw["group_map"] = {"rna": "dnase", "chip": "dnase"}
+    out = train(tmp_path, data_dir, "one_group_mapped", 0, lw, epochs=1)
+    assert "weight_dnase" in pd.read_csv(out / "class_weights_ds0.tsv", sep="\t")
+
+
+def test_group_table_checks(tmp_path, data_dir, capsys):
+    tsv = tmp_path / "dup.tsv"
+    tsv.write_text("class\tdnase\tdnase\nbg\t1\t1\nhot\t2\t2\n")
+    with pytest.raises(ValueError, match="duplicate columns"):
+        RegionClassMap.from_files(tmp_path / "missing.bed", tsv, "bg")
+    table = {
+        "bg": {"rna": 1, "dnase": 1, "chip": 1, "cage": 1},
+        "hot": {"rna": 2, "dnase": 2, "chip": 2, "cage": 2},
+    }
+    _, _, cm = group_class_map(tmp_path, data_dir, table)
+    ds = SeqDataset(str(data_dir), "train", fold=0)
+    cm.track_groups(ds.targets_df, strand_pair=ds.strand_pair)
+    assert "no tracks: ['cage']" in capsys.readouterr().out
+    # strand partners a+ / a- (tracks 0, 1) split across groups
+    with pytest.raises(ValueError, match="strand partners"):
+        cm.track_groups(
+            ds.targets_df,
+            group_by="identifier",
+            group_map={"a+": "rna", "a-": "dnase", "b": "dnase", "c": "chip"},
+            strand_pair=ds.strand_pair,
+        )
+
+
+def test_group_options_with_shared_table_warn(tmp_path, data_dir, capsys):
+    lw = hot_weights(tmp_path, data_dir, 2.0)
+    lw["group_by"] = "assay"
+    train(tmp_path, data_dir, "shared_group_by", 0, lw, epochs=1)
+    assert "ignored for a shared table" in capsys.readouterr().out

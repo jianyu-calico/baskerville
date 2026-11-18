@@ -336,20 +336,28 @@ class Trainer:
         for di, ds in enumerate(self.train_data):
             cw = sw = tg = None
             if getattr(ds, "class_map", None) is not None:
-                counts = loss_weights.class_bin_counts(ds)
-                loss_weights.check_class_coverage(ds, counts)
+                by_split = loss_weights.class_bin_counts_by_split(ds)
+                loss_weights.check_class_coverage(ds, by_split)
                 w = loss_weights.normalize_class_weights(
-                    ds.class_map.class_weights, counts
+                    ds.class_map.class_weights, by_split["train"]
                 )
                 loss_weights.write_class_weights(
-                    f"{self.out_dir}/class_weights_ds{di}.tsv", ds.class_map, w, counts
+                    f"{self.out_dir}/class_weights_ds{di}.tsv",
+                    ds.class_map,
+                    w,
+                    by_split,
                 )
                 cw = torch.tensor(w, dtype=torch.float32, device=self.device)
-                if ds.class_map.num_groups > 1:
+                if ds.class_map.shared:
+                    if config.get("group_by") or config.get("group_map"):
+                        print("warning: group_by/group_map ignored for a shared table")
+                else:
+                    # validate even a single group column against every track
                     groups = ds.class_map.track_groups(
                         ds.targets_df,
                         config.get("group_by", "assay"),
                         config.get("group_map"),
+                        ds.strand_pair,
                     )
                     tg = torch.tensor(groups, device=self.device)
             if config.get("sample_weights"):

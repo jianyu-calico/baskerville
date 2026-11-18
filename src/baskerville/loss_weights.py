@@ -7,18 +7,26 @@ Two inputs, both optional:
      half-open, hg38, non-overlapping within a chromosome). A 32 bp output bin gets
      the class of the interval containing the bin's midpoint; bins outside every
      interval get ``default_class`` (an error if that is unset).
-   - ``class_weights``: TSV with header ``class weight``. Every class used in the BED
-     (and ``default_class``) must be listed. Row order defines the integer class id.
+   - ``class_weights``: TSV with header ``class weight`` (one weight per class, shared by
+     all tracks), or ``class <group> <group> ...`` (one weight per class and track group,
+     e.g. per assay). Every class used in the BED (and ``default_class``) must be
+     listed. Row order defines the integer class id.
+   - Track groups: each track's value in the targets table column ``group_by`` (default
+     ``assay``), optionally renamed by ``group_map`` (e.g. ``{"rna3": "rna"}``); every
+     group must have a column in a per-group table.
    The dataset returns integer class ids per bin; the trainer looks weights up in a
-   (num_classes,) tensor, so an online method can change that tensor in place.
+   (num_classes, num_groups) tensor (num_groups = 1 for a shared table), so an online
+   method can change that tensor in place.
 
 2. Sample (window) weights.
    - ``sample_weights``: TSV with header ``chrom start end weight``, keyed by the
      window coordinates in the dataset's ``sequences.bed``. Windows not listed get 1.
 
 Weights are rescaled to mean 1 over the training set (class weights by bin counts
-over all training windows, overlaps counted as trained; sample weights over
-training windows), because the loss divides by fixed constants, never per batch.
+over all training windows, overlaps counted as trained, separately within each track
+group, so each group keeps its share of the loss; sample weights over training
+windows), because the loss divides by fixed constants, never per batch. Sample and
+class weights are rescaled separately, not their product.
 """
 
 from __future__ import annotations
@@ -36,7 +44,8 @@ class RegionClassMap:
     """Interval -> class id lookup for output bins."""
 
     class_names: list[str]
-    class_weights: np.ndarray  # (num_classes,) raw weights from the TSV
+    class_weights: np.ndarray  # (num_classes, num_groups) raw weights from the TSV
+    group_names: list[str | None]  # [None] for a shared table
     default_class: int | None
     # per chromosome: sorted starts, ends, class ids
     intervals: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]]
@@ -49,11 +58,20 @@ class RegionClassMap:
         default_class: str | None = None,
     ) -> RegionClassMap:
         table = pd.read_csv(class_weights, sep="\t", dtype={"class": str})
-        if list(table.columns[:2]) != ["class", "weight"]:
-            raise ValueError(f"{class_weights}: expected header 'class<TAB>weight'")
+        if table.columns[0] != "class" or len(table.columns) < 2:
+            raise ValueError(
+                f"{class_weights}: expected header 'class<TAB>weight' or "
+                "'class<TAB><group>...'"
+            )
         if table["class"].duplicated().any():
             raise ValueError(f"{class_weights}: duplicate classes")
-        weights = table["weight"].to_numpy(dtype=np.float64)
+        if list(table.columns) == ["class", "weight"]:
+            group_names = [None]
+        else:
+            group_names = [str(g) for g in table.columns[1:]]
+            if "weight" in group_names:
+                raise ValueError(f"{class_weights}: 'weight' can't be a group column")
+        weights = table.iloc[:, 1:].to_numpy(dtype=np.float64)
         if (weights < 0).any() or not np.isfinite(weights).all():
             raise ValueError(f"{class_weights}: weights must be finite and >= 0")
         names = table["class"].tolist()
@@ -94,7 +112,30 @@ class RegionClassMap:
                     f"default_class {default_class!r} not in {class_weights}"
                 )
             default = index[default_class]
-        return cls(names, weights, default, intervals)
+        return cls(names, weights, group_names, default, intervals)
+
+    @property
+    def num_groups(self) -> int:
+        return len(self.group_names)
+
+    def track_groups(
+        self, targets_df: pd.DataFrame, group_by: str = "assay", group_map=None
+    ) -> np.ndarray:
+        """Group index (into ``group_names``) of each track; all 0 for a shared table."""
+        if self.group_names == [None]:
+            return np.zeros(len(targets_df), dtype=np.int64)
+        if group_by not in targets_df.columns:
+            raise ValueError(
+                f"targets table has no {group_by!r} column for track groups"
+            )
+        groups = targets_df[group_by].astype(str)
+        if group_map:
+            groups = groups.replace(group_map)
+        index = {g: i for i, g in enumerate(self.group_names)}
+        missing = sorted(set(groups) - set(index))
+        if missing:
+            raise ValueError(f"track groups without a class-weight column: {missing}")
+        return groups.map(index).to_numpy(dtype=np.int64)
 
     @property
     def num_classes(self) -> int:
@@ -122,12 +163,13 @@ class RegionClassMap:
 
 
 def normalize_class_weights(weights: np.ndarray, bin_counts: np.ndarray) -> np.ndarray:
-    """Rescale class weights so the mean weight over training bins is 1."""
+    """Rescale class weights so the mean weight over training bins is 1 (per column,
+    i.e. within each track group, for a (num_classes, num_groups) table)."""
     total = bin_counts.sum()
-    mean = float((weights * bin_counts).sum() / total) if total else 0.0
-    if mean <= 0:
-        raise ValueError("class weights are zero on every training bin")
-    return weights / mean
+    means = (weights * bin_counts[:, None]).sum(axis=0) / max(total, 1)
+    if (means <= 0).any():
+        raise ValueError("class weights are zero on every training bin (in some group)")
+    return weights / means
 
 
 def read_sample_weights(path: str | Path, windows: pd.DataFrame) -> np.ndarray:
@@ -185,7 +227,7 @@ def check_class_coverage(ds, counts) -> list[str]:
     empty = [
         name
         for name, w, n in zip(
-            ds.class_map.class_names, ds.class_map.class_weights, counts
+            ds.class_map.class_names, ds.class_map.class_weights.max(axis=1), counts
         )
         if w > 0 and n == 0
     ]
@@ -198,14 +240,14 @@ def check_class_coverage(ds, counts) -> list[str]:
 
 
 def write_class_weights(path, class_map: RegionClassMap, weights, counts) -> None:
-    pd.DataFrame(
-        {
-            "class": class_map.class_names,
-            "weight_raw": class_map.class_weights,
-            "weight": weights,
-            "train_bins": counts,
-        }
-    ).to_csv(path, sep="\t", index=False)
+    """Raw and normalized weights per class (columns per group for a per-group table)."""
+    table = {"class": class_map.class_names}
+    for gi, g in enumerate(class_map.group_names):
+        suffix = "" if g is None else f"_{g}"
+        table[f"weight_raw{suffix}"] = class_map.class_weights[:, gi]
+        table[f"weight{suffix}"] = weights[:, gi]
+    table["train_bins"] = counts
+    pd.DataFrame(table).to_csv(path, sep="\t", index=False)
 
 
 @dataclasses.dataclass

@@ -85,6 +85,7 @@ class Trainer:
     hook = None
     class_weights: list = []
     sample_weights: list = []
+    track_groups: list = []
     _epoch = 0
     _step = 0
     _last_step = None
@@ -322,7 +323,8 @@ class Trainer:
     def _setup_loss_weights(self, hook):
         """Per-dataset class (bin) and sample weights, normalized to mean 1 over training.
 
-        ``class_weights[di]`` is a device tensor indexed by a batch's ``bin_labels``;
+        ``class_weights[di]`` is a (num_classes, num_groups) device tensor indexed by a
+        batch's ``bin_labels`` and, per track, ``track_groups[di]`` (None if shared);
         ``sample_weights[di]`` is indexed by ``seq_index``. An online-reweighting
         ``hook`` may edit them in place (see ``loss_weights.StepInfo``).
         """
@@ -330,9 +332,9 @@ class Trainer:
         self.hook = (
             hook if hook is not None else loss_weights.load_hook(config.get("hook"))
         )
-        self.class_weights, self.sample_weights = [], []
+        self.class_weights, self.sample_weights, self.track_groups = [], [], []
         for di, ds in enumerate(self.train_data):
-            cw = sw = None
+            cw = sw = tg = None
             if getattr(ds, "class_map", None) is not None:
                 counts = loss_weights.class_bin_counts(ds)
                 loss_weights.check_class_coverage(ds, counts)
@@ -343,6 +345,13 @@ class Trainer:
                     f"{self.out_dir}/class_weights_ds{di}.tsv", ds.class_map, w, counts
                 )
                 cw = torch.tensor(w, dtype=torch.float32, device=self.device)
+                if ds.class_map.num_groups > 1:
+                    groups = ds.class_map.track_groups(
+                        ds.targets_df,
+                        config.get("group_by", "assay"),
+                        config.get("group_map"),
+                    )
+                    tg = torch.tensor(groups, device=self.device)
             if config.get("sample_weights"):
                 raw = loss_weights.read_sample_weights(
                     config["sample_weights"], ds.seqs_bed
@@ -351,6 +360,7 @@ class Trainer:
                 sw = torch.tensor(w, dtype=torch.float32, device=self.device)
             self.class_weights.append(cw)
             self.sample_weights.append(sw)
+            self.track_groups.append(tg)
         weighted = any(w is not None for w in self.class_weights + self.sample_weights)
         if weighted and self.loss != "poisson_mn":
             raise ValueError(f"loss weights need the poisson_mn loss, not {self.loss}")
@@ -364,7 +374,11 @@ class Trainer:
         labels = bin_w = sample_w = None
         if self.class_weights[di] is not None:
             labels = batch_data.bin_labels.to(self.device, non_blocking=True).long()
-            bin_w = self.class_weights[di][labels]
+            cw, tg = self.class_weights[di], self.track_groups[di]
+            if tg is None:
+                bin_w = cw[labels, 0]  # B x L, shared by tracks
+            else:
+                bin_w = cw[:, tg][labels].permute(0, 2, 1)  # B x T x L
         if self.sample_weights[di] is not None:
             seq_index = batch_data.seq_index.to(self.device, non_blocking=True)
             sample_w = self.sample_weights[di][seq_index]

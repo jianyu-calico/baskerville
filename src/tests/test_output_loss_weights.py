@@ -59,7 +59,8 @@ def make_data(root, crop_bp=0):
     pd.DataFrame(
         {
             "identifier": ["a+", "a-", "b", "c"],
-            "description": ["RNA:a", "RNA:a", "DNASE:b", "DNASE:c"],
+            "description": ["RNA:a", "RNA:a", "DNASE:b", "CHIP:c"],
+            "assay": ["rna", "rna", "dnase", "chip"],
             "strand_pair": [1, 0, 2, 3],
         }
     ).to_csv(root / "targets.txt", sep="\t")
@@ -188,8 +189,12 @@ def test_overlapping_intervals_rejected(tmp_path):
 
 
 def test_class_weight_normalization():
-    w = normalize_class_weights(np.array([1.0, 3.0]), np.array([30, 10]))
-    assert np.allclose(w, [1 / 1.5, 2.0])
+    w = normalize_class_weights(np.array([[1.0], [3.0]]), np.array([30, 10]))
+    assert np.allclose(w[:, 0], [1 / 1.5, 2.0])
+    # per group: each column has mean 1 over the training bins
+    w = normalize_class_weights(np.array([[1.0, 2.0], [3.0, 0.0]]), np.array([30, 10]))
+    assert np.allclose((w * np.array([30, 10])[:, None]).sum(axis=0) / 40, [1.0, 1.0])
+    assert np.allclose(w, [[1 / 1.5, 4 / 3], [2.0, 0.0]])
 
 
 def test_read_sample_weights(data_dir, tmp_path):
@@ -511,7 +516,7 @@ def test_hook_and_resume_restore_weights(tmp_path, data_dir):
     assert steps == [("step", 0, 0), ("step", 0, 1), ("step", 1, 2), ("step", 1, 3)]
     w0 = pd.read_csv(out / "class_weights_ds0.tsv", sep="\t").weight.to_numpy()
     state = torch.load(out / "loss_weights_state.pt")
-    expected = torch.tensor([w0[0], w0[1] * 0.25], dtype=torch.float32)
+    expected = torch.tensor([[w0[0]], [w0[1] * 0.25]], dtype=torch.float32)
     assert torch.allclose(state["class_weights"][0], expected)
 
     # resume for one more epoch: weights come back from the state file, no on_train_start
@@ -520,5 +525,129 @@ def test_hook_and_resume_restore_weights(tmp_path, data_dir):
     assert ("start",) not in RecordingHook.calls
     state = torch.load(out / "loss_weights_state.pt")
     assert torch.allclose(
-        state["class_weights"][0], expected * torch.tensor([1.0, 0.5])
+        state["class_weights"][0], expected * torch.tensor([[1.0], [0.5]])
     )
+
+
+# -- per-group (per-assay) class weights ------------------------------------------
+
+
+def write_group_table(tmp_path, table):
+    """table: {class: {group: weight}} -> per-group class-weight TSV."""
+    tsv = tmp_path / "group_weights.tsv"
+    df = pd.DataFrame(table).T.rename_axis("class").reset_index()
+    df.to_csv(tsv, sep="\t", index=False)
+    return tsv
+
+
+def group_class_map(tmp_path, data_dir, table):
+    """Class 'hot' on bins 0-1 of every training window, 'bg' elsewhere."""
+    ds = SeqDataset(str(data_dir), "train", fold=0)
+    rows = []
+    for i in range(len(ds)):
+        r = ds.seqs_bed.iloc[ds.seq_indexes[i]]
+        rows.append((r.chrom, r.start, r.start + 2 * POOL, "hot"))
+    bed = tmp_path / "classes.bed"
+    pd.DataFrame(rows).to_csv(bed, sep="\t", header=False, index=False)
+    tsv = write_group_table(tmp_path, table)
+    return bed, tsv, RegionClassMap.from_files(bed, tsv, "bg")
+
+
+def test_group_table_parsing_and_track_groups(tmp_path, data_dir):
+    table = {
+        "bg": {"rna": 1, "dnase": 1, "chip": 1},
+        "hot": {"rna": 3, "dnase": 0, "chip": 1},
+    }
+    _, _, cm = group_class_map(tmp_path, data_dir, table)
+    assert cm.group_names == ["rna", "dnase", "chip"]
+    assert cm.class_weights.shape == (2, 3)
+    targets = SeqDataset(str(data_dir), "train", fold=0).targets_df
+    assert cm.track_groups(targets).tolist() == [0, 0, 1, 2]
+    # merging assays into groups, and a missing group column
+    merged = {"bg": {"rna": 1, "open": 1}, "hot": {"rna": 2, "open": 2}}
+    _, _, cm2 = group_class_map(tmp_path, data_dir, merged)
+    groups = cm2.track_groups(targets, group_map={"dnase": "open", "chip": "open"})
+    assert groups.tolist() == [0, 0, 1, 1]
+    with pytest.raises(ValueError, match="without a class-weight column"):
+        cm2.track_groups(targets)
+    # a shared table puts every track in group 0
+    _, _, shared = write_classes(
+        tmp_path, [("chr1", 0, 64, "hot")], {"bg": 1, "hot": 2}
+    )
+    assert shared.group_names == [None]
+    assert shared.track_groups(targets).tolist() == [0] * NUM_TARGETS
+
+
+def lookup_trainer(class_map, data_dir):
+    """A Trainer holding only the loss-weight state, to test the per-batch lookup."""
+    from baskerville.trainer import Trainer
+
+    ds = SeqDataset(str(data_dir), "train", mode="train", fold=0, class_map=class_map)
+    t = Trainer.__new__(Trainer)
+    t.device = "cpu"
+    t.class_weights = [torch.tensor(class_map.class_weights, dtype=torch.float32)]
+    t.sample_weights = [None]
+    groups = class_map.track_groups(ds.targets_df)
+    t.track_groups = [torch.tensor(groups) if class_map.num_groups > 1 else None]
+    return t, ds
+
+
+def test_group_lookup_orientation_and_rc(tmp_path, data_dir):
+    table = {
+        "bg": {"rna": 1, "dnase": 1, "chip": 1},
+        "hot": {"rna": 3, "dnase": 0, "chip": 2},
+    }
+    _, _, cm = group_class_map(tmp_path, data_dir, table)
+    t, ds = lookup_trainer(cm, data_dir)
+    for rc in (False, True):
+        batch = BatchData.collate([ds[(0, 0, rc)], ds[(1, 0, rc)]])
+        _, bin_w, _ = t._batch_loss_weights(0, batch)
+        assert bin_w.shape == (2, NUM_TARGETS, BINS)
+        hot = [BINS - 2, BINS - 1] if rc else [0, 1]
+        others = [b for b in range(BINS) if b not in hot]
+        # tracks 0,1 rna (3), track 2 dnase (0), track 3 chip (2); other bins 1
+        for track, w in enumerate([3.0, 3.0, 0.0, 2.0]):
+            assert torch.all(bin_w[:, track, hot] == w)
+            assert torch.all(bin_w[:, track, others] == 1.0)
+
+
+def test_group_zero_weight_leaves_other_groups_untouched(tmp_path, data_dir):
+    table = {
+        "bg": {"rna": 1, "dnase": 1, "chip": 1},
+        "hot": {"rna": 1, "dnase": 0, "chip": 1},
+    }
+    _, _, cm = group_class_map(tmp_path, data_dir, table)
+    t, ds = lookup_trainer(cm, data_dir)
+    batch = BatchData.collate([ds[(0, 0, False)], ds[(1, 0, False)]])
+    _, bin_w, _ = t._batch_loss_weights(0, batch)
+    y_true = batch.coverage_targets.float()
+    fn = PoissonMultinomialLoss(**KW)
+
+    def grad(weights):
+        y_pred = (y_true + 0.5).clone().requires_grad_(True)
+        fn(y_pred, y_true, bin_weights=weights).backward()
+        return y_pred.grad
+
+    g, g_ref = grad(bin_w), grad(torch.ones_like(bin_w))
+    assert torch.equal(g[:, [0, 1, 3]], g_ref[:, [0, 1, 3]])  # rna, chip unchanged
+    assert torch.all(g[:, 2, :2] == 0)  # dnase hot bins removed
+    assert not torch.equal(g[:, 2], g_ref[:, 2])
+
+
+def test_all_ones_group_table_equals_unweighted_training(tmp_path, data_dir):
+    a = model_state(train(tmp_path, data_dir, "a", 1))
+    table = {
+        "bg": {"rna": 1, "dnase": 1, "chip": 1},
+        "hot": {"rna": 1, "dnase": 1, "chip": 1},
+    }
+    bed, tsv, _ = group_class_map(tmp_path, data_dir, table)
+    lw = {"bin_classes": str(bed), "class_weights": str(tsv), "default_class": "bg"}
+    assert same(a, model_state(train(tmp_path, data_dir, "group_ones", 1, lw)))
+    table["hot"]["rna"] = 4
+    lw["class_weights"] = str(write_group_table(tmp_path, table))
+    hot = train(tmp_path, data_dir, "group_hot", 1, lw)
+    assert not same(a, model_state(hot))
+    w = pd.read_csv(hot / "class_weights_ds0.tsv", sep="\t")
+    for g in ("rna", "dnase", "chip"):  # mean 1 within each group
+        mean = (w[f"weight_{g}"] * w.train_bins).sum() / w.train_bins.sum()
+        assert abs(mean - 1) < 1e-9

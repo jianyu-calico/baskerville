@@ -103,6 +103,14 @@ def main(argv=None):
 
     # optional output-loss weights over region classes (see loss_weights.py)
     lw = params["train"].get("loss_weights", {}) or {}
+    dev = params["train"].get("deviation_loss", {}) or {}
+    unit_map = None
+    if float(dev.get("lambda", 0.0)) != 0:
+        if len(args.data_dirs) > 1:
+            parser.error("the deviation loss supports a single data directory")
+        unit_map = loss_weights.RegionClassMap.unit_map(
+            dev["bin_classes"], dev.get("unit_classes", ["gene_var", "gene_const"])
+        )
     if (lw.get("bin_classes") or lw.get("sample_weights")) and len(args.data_dirs) > 1:
         # one region-class BED / sequence-weight table is keyed to one genome's windows
         parser.error("loss_weights support a single data directory")
@@ -139,6 +147,7 @@ def main(argv=None):
                     split_label="*",
                     mode="train",
                     class_map=class_map,
+                    unit_map=unit_map,
                     extra_crop_bp=extra_crop_bp,
                     extra_crop_bins=extra_crop_bins,
                     fold=args.fold,
@@ -153,6 +162,7 @@ def main(argv=None):
                     split_label="train",
                     mode="train",
                     class_map=class_map,
+                    unit_map=unit_map,
                     extra_crop_bp=extra_crop_bp,
                     extra_crop_bins=extra_crop_bins,
                     fold=args.fold,

@@ -8,11 +8,13 @@ import time
 from tqdm import tqdm
 
 import numpy as np
+import pandas as pd
 import torch
 from torch.optim.lr_scheduler import LambdaLR, LinearLR, SequentialLR
 from schedulefree import AdamWScheduleFree
 
 from baskerville import dataset
+from baskerville import deviation_loss
 from baskerville import loss_weights
 from baskerville import metrics
 from baskerville.types import BatchData, ModelOutput
@@ -86,6 +88,8 @@ class Trainer:
     class_weights: list = []
     sample_weights: list = []
     track_groups: list = []
+    dev_loss = None
+    dev_lambda = 0.0
     _epoch = 0
     _step = 0
     _last_step = None
@@ -319,6 +323,7 @@ class Trainer:
             # to avoid double-augmenting.
 
         self._setup_loss_weights(hook)
+        self._setup_deviation_loss()
 
     def _setup_loss_weights(self, hook):
         """Per-dataset class (bin) and sample weights, normalized to mean 1 over training.
@@ -374,6 +379,80 @@ class Trainer:
             raise ValueError(f"loss weights need the poisson_mn loss, not {self.loss}")
         self._epoch = self._step = 0
         self._last_step = None
+
+    def _setup_deviation_loss(self):
+        """``params["deviation_loss"]`` -> ``self.dev_loss`` (None when off or lambda 0).
+
+        Keys: lambda, cell_types (TSV keyed by identifier), group_column, assays,
+        block_bins, pseudocount, threshold, denominators (per assay; estimated from
+        ``denominator_windows`` training windows when omitted). The train dataset
+        must carry a unit map (hound_train builds it from ``unit_classes``).
+        """
+        config = self.params.get("deviation_loss", {}) or {}
+        self.dev_lambda = float(config.get("lambda", 0.0))
+        self.dev_loss = None
+        self._dev_sums = [0.0, 0.0, 0]  # coverage loss, L_dev, batches this epoch
+        if self.dev_lambda == 0:
+            return
+        if self.loss != "poisson_mn" or len(self.train_data) != 1:
+            raise ValueError("deviation loss needs poisson_mn and one train dataset")
+        ds = self.train_data[0]
+        if getattr(ds, "unit_map", None) is None:
+            raise ValueError("deviation loss needs a train dataset with a unit map")
+        cell_types = pd.read_csv(config["cell_types"], sep="\t")
+        groups = deviation_loss.assay_groups(
+            ds.targets_df,
+            cell_types,
+            config.get("assays", ["rna"]),
+            ds.strand_pair,
+            config.get("group_column", "cell_type_group"),
+        )
+        pw_loss = metrics.PoissonMultinomialLoss(
+            weight_range=self.weight_range, weight_exp=self.weight_exp
+        )
+        pw_loss._setup_position_weights(ds.target_length, "cpu")
+        self.dev_loss = deviation_loss.DeviationLoss(
+            groups,
+            pw_loss.position_weights.flatten(),
+            block_bins=int(config.get("block_bins", 4)),
+            pseudocount=float(config.get("pseudocount", 0.1)),
+            threshold=float(config.get("threshold", 1.0)),
+        ).to(self.device)
+        denominators = config.get("denominators")
+        if denominators is None:
+            denominators = self._estimate_dev_denominators(
+                ds, int(config.get("denominator_windows", 32))
+            )
+        self.dev_loss.denominators = [float(d) for d in np.atleast_1d(denominators)]
+        if len(self.dev_loss.denominators) != len(groups):
+            raise ValueError("deviation loss: need one denominator per assay")
+        with open(f"{self.out_dir}/deviation_loss_setup.json", "w") as f:
+            json.dump(
+                {
+                    "lambda": self.dev_lambda,
+                    "assays": [g.assay for g in groups],
+                    "tracks": [len(g.tracks) for g in groups],
+                    "groups": [g.group_names for g in groups],
+                    "denominators": self.dev_loss.denominators,
+                },
+                f,
+                indent=2,
+            )
+
+    def _estimate_dev_denominators(self, ds, n_windows):
+        """Average per-window sum of w_k over a seeded sample of training windows."""
+        rng = np.random.default_rng([self.seed or 0, 12345])
+        idx = rng.choice(len(ds), size=min(n_windows, len(ds)), replace=False)
+        sums = []
+        for i in idx:
+            item = ds[(int(i), 0, False)] if ds.mode == "train" else ds[int(i)]
+            y = item.coverage_targets.float()[None].to(self.device)
+            mask = item.unit_mask[None].to(self.device)
+            sums.append(self.dev_loss.unit_weight_sums(y, mask).cpu())
+        mean = torch.cat(sums).mean(dim=0)
+        if (mean <= 0).any():
+            raise ValueError("deviation loss: no weighted units in the sampled windows")
+        return mean.tolist()
 
     def _batch_loss_weights(self, di, batch_data):
         """(bin_labels, bin_weights, sample_weights) on the device; None where unset."""
@@ -459,8 +538,10 @@ class Trainer:
         di: int,
         bin_weights: torch.Tensor | None = None,
         sample_weights: torch.Tensor | None = None,
+        unit_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Compute combined loss from model output."""
+        """Compute combined loss from model output; adds lambda * L_dev when the
+        deviation loss is on and a ``unit_mask`` is given (training batches only)."""
         loss = torch.tensor(0.0, device=self.device)
 
         if yh.has_coverage and y is not None:
@@ -475,6 +556,13 @@ class Trainer:
                     sample_weights=sample_weights,
                 )
             loss = loss + cov_loss * species_weight
+            if self.dev_loss is not None and unit_mask is not None:
+                dev = self.dev_loss(yh.coverage, y, unit_mask)
+                loss = loss + self.dev_lambda * dev * species_weight
+                # detached tensors: no host sync per step
+                self._dev_sums[0] = self._dev_sums[0] + cov_loss.detach()
+                self._dev_sums[1] = self._dev_sums[1] + dev.detach()
+                self._dev_sums[2] += 1
 
         if yh.has_gene and yg is not None:
             loss = (
@@ -1290,6 +1378,12 @@ class Trainer:
         )
         hi = di if self.model_heads is None else self.model_heads
         labels, bin_w, sample_w = self._batch_loss_weights(di, batch_data)
+        unit_mask = None
+        if (
+            self.dev_loss is not None
+            and getattr(batch_data, "unit_mask", None) is not None
+        ):
+            unit_mask = batch_data.unit_mask.to(self.device, non_blocking=True)
 
         with torch.autocast(device_type=self.device, dtype=self.mix_dtype):
             yh = self.model(
@@ -1299,7 +1393,9 @@ class Trainer:
                 gene_out_mask=gene_out_mask,
                 gene_presence=gene_presence,
             )
-            loss = self._compute_loss(yh, y, yg, gene_presence, sw, di, bin_w, sample_w)
+            loss = self._compute_loss(
+                yh, y, yg, gene_presence, sw, di, bin_w, sample_w, unit_mask
+            )
 
         if self.hook is not None and hasattr(self.hook, "after_step"):
             self._last_step = loss_weights.StepInfo(
@@ -1345,6 +1441,22 @@ class Trainer:
         self._epoch = ei
         self.train_sampler.set_epoch(ei)
         self._train_epoch_batches(ei)
+        if self.dev_loss is not None and self._dev_sums[2]:
+            cov, dev, n = (
+                float(self._dev_sums[0]),
+                float(self._dev_sums[1]),
+                self._dev_sums[2],
+            )
+            log_file = f"{self.out_dir}/deviation_loss.tsv"
+            new = not os.path.exists(log_file)
+            with open(log_file, "a") as f:
+                if new:
+                    f.write("epoch\tcoverage_loss\tdeviation_loss\tlambda\tdev_share\n")
+                share = self.dev_lambda * dev / (cov + self.dev_lambda * dev)
+                f.write(
+                    f"{ei}\t{cov / n:.6g}\t{dev / n:.6g}\t{self.dev_lambda}\t{share:.4f}\n"
+                )
+            self._dev_sums = [0.0, 0.0, 0]
         if self.hook is not None and hasattr(self.hook, "on_epoch_end"):
             self.hook.on_epoch_end(self, ei)
         if any(w is not None for w in self.class_weights + self.sample_weights):

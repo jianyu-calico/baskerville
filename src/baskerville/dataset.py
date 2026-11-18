@@ -133,6 +133,8 @@ class SeqDataset(Dataset):
       extra_crop_bins (int): Optional output cropping in bins.
       class_map (RegionClassMap): Optional region classes; items then carry
         per-bin class ids (``bin_labels``) for loss weighting.
+      unit_map (RegionClassMap): Optional ``RegionClassMap.unit_map``; items then carry
+        a per-bin ``unit_mask`` (bins of the unit classes) for the deviation loss.
     """
 
     def __init__(
@@ -147,6 +149,7 @@ class SeqDataset(Dataset):
         fold: int | None = None,
         cross: int = 0,
         class_map=None,
+        unit_map=None,
     ):
         super().__init__()
         self.data_dir = data_dir
@@ -215,8 +218,9 @@ class SeqDataset(Dataset):
             self.seq_indexes = map_seq_indexes(
                 self.seqs_bed, self.zarr_files, zarr_seqs
             )
-        if self.class_map is not None and self.seq_indexes is None:
-            raise ValueError(f"class_map needs {seqs_bed_file} matching the zarr files")
+        self.unit_map = unit_map
+        if (class_map or unit_map) is not None and self.seq_indexes is None:
+            raise ValueError(f"class maps need {seqs_bed_file} matching the zarr files")
         # sequences.bed rows are the target region (hound_data already removed crop_bp),
         # so only extra output cropping moves the first bin
         self.bin_offset = (self.extra_crop_bins or 0) * self.pool_width
@@ -248,10 +252,12 @@ class SeqDataset(Dataset):
     def __len__(self):
         return self.zarr_cumseqs[-1]
 
-    def bin_labels(self, idx: int) -> np.ndarray:
-        """Region-class id of each output bin of example ``idx`` (forward strand)."""
+    def bin_labels(self, idx: int, class_map=None) -> np.ndarray:
+        """Region-class id of each output bin of example ``idx`` (forward strand), from
+        ``class_map`` (default: the dataset's loss-weight class map)."""
         row = self.seqs_bed.iloc[self.seq_indexes[idx]]
-        return self.class_map.label_bins(
+        class_map = self.class_map if class_map is None else class_map
+        return class_map.label_bins(
             row.chrom,
             int(row.start) + self.bin_offset,
             self.target_length,
@@ -313,9 +319,11 @@ class SeqDataset(Dataset):
             gene_presence = torch.from_numpy(gene_presence)
             gene_out_mask = torch.from_numpy(gene_out_mask)
 
-        bin_labels = None
+        bin_labels = unit_mask = None
         if self.class_map is not None:
             bin_labels = torch.from_numpy(self.bin_labels(idx))
+        if self.unit_map is not None:
+            unit_mask = torch.from_numpy(self.bin_labels(idx, self.unit_map) > 0)
 
         # stochastic augmentations
         if self.mode == "train":
@@ -337,6 +345,8 @@ class SeqDataset(Dataset):
                     gene_out_mask = torch.flip(gene_out_mask, [-1])
                 if bin_labels is not None:
                     bin_labels = torch.flip(bin_labels, [0])
+                if unit_mask is not None:
+                    unit_mask = torch.flip(unit_mask, [0])
 
         # sequence to 1-hot torch
         seq_1hot = np.zeros((self.seq_depth + 1, self.seq_length), dtype="bool")
@@ -355,6 +365,7 @@ class SeqDataset(Dataset):
                 else None
             ),
             bin_labels=bin_labels,
+            unit_mask=unit_mask,
         )
 
 

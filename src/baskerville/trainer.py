@@ -384,7 +384,7 @@ class Trainer:
         """``params["deviation_loss"]`` -> ``self.dev_loss`` (None when off or lambda 0).
 
         Keys: lambda, cell_types (TSV keyed by identifier), group_column, assays,
-        space ("transformed" or "untransformed"), block_bins, and per assay (scalar
+        space ("untransformed", the default, or "transformed"), block_bins, and per assay (scalar
         or list) pseudocount, threshold and denominators. Set ``denominators`` in the
         config (``deviation_loss.estimate_denominators``, >= 500 training windows) so
         all seeds share them; when omitted they are estimated at start from
@@ -422,7 +422,7 @@ class Trainer:
             block_bins=int(config.get("block_bins", 4)),
             pseudocount=config.get("pseudocount", 0.1),
             threshold=config.get("threshold", 1.0),
-            space=config.get("space", "transformed"),
+            space=config.get("space", "untransformed"),
         ).to(self.device)
         denominators = config.get("denominators")
         estimated = denominators is None

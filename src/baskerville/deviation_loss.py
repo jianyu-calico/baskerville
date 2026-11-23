@@ -12,7 +12,7 @@ unit class, e.g. gene exons/TSS):
 
 In ``space="untransformed"``, targets and predictions are first mapped back to
 coverage per track (soft clip, sqrt and scale undone, as for the specificity metric:
-``((y + 1)^2 - 1) / scale`` for ``sum_sqrt`` tracks); ``"transformed"`` uses the
+``((y + 1)^2 - 1) / scale`` for ``sum_sqrt`` tracks; the default); ``"transformed"`` uses the
 dataset's values as stored. w_k = min(1, E_k / threshold) * position weight of the
 block, with E_k the unit's target sum averaged over the samples (targets only, no
 gradient). D is a fixed denominator (the average per-window sum of w_k over training
@@ -137,8 +137,10 @@ def assay_groups(
 
 def untransform(y, scale, clip_soft, sqrt):
     """Dataset values (B, T, L) -> coverage: undo soft clip, sqrt and scale per track."""
-    cs = clip_soft[None, :, None]
-    y = torch.where(y > cs, cs - 1 + (y - cs + 1) ** 2, y)
+    # soft clip: cs - 1 + (y - cs + 1)^2 above cs, i.e. y + e (e + 1) with e = relu(y - cs);
+    # written without torch.where so an infinite cs (unset) gives no NaN gradient
+    e = torch.relu(y - clip_soft[None, :, None])
+    y = y + e * (e + 1)
     y = torch.where(sqrt[None, :, None], (y + 1) ** 2 - 1, y)
     return y / scale[None, :, None]
 
@@ -172,7 +174,7 @@ class DeviationLoss(torch.nn.Module):
         every assay); target scales differ a lot between assays and spaces.
       denominators: per assay, the fixed average per-window sum of w_k on training
         windows (a scalar applies to every assay).
-      space: "transformed" (dataset values) or "untransformed" (coverage).
+      space: "untransformed" (coverage, default) or "transformed" (dataset values).
     """
 
     def __init__(
@@ -183,7 +185,7 @@ class DeviationLoss(torch.nn.Module):
         pseudocount=0.1,
         threshold=1.0,
         denominators=1.0,
-        space: str = "transformed",
+        space: str = "untransformed",
     ):
         super().__init__()
         if position_weights.numel() % block_bins:

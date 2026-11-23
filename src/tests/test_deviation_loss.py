@@ -440,7 +440,8 @@ def test_matches_independent_reference(space):
 def test_strand_partners_are_summed_before_the_log():
     targets, cells, sp = toy_targets()
     (g,) = assay_groups(targets, cells, ["rna"], sp)
-    loss = DeviationLoss([g], torch.ones(BINS), threshold=1.0)
+    # in the dataset's space, so moving values between strands keeps the sample sum
+    loss = DeviationLoss([g], torch.ones(BINS), threshold=1.0, space="transformed")
     yhat, y, mask = rand_batch(B=1, T=6)
     base = loss(yhat, y, mask)
     # moving signal between the two strands of one library changes nothing
@@ -535,3 +536,33 @@ def test_denominators_do_not_depend_on_the_training_seed(rna_data, tmp_path):
         ).read_text()
     )
     assert setup["denominators"] == [7.5] and setup["denominators_estimated"] is False
+
+
+def test_default_space_is_untransformed(rna_data, tmp_path):
+    targets, cells, sp = toy_targets()
+    (g,) = assay_groups(targets, cells, ["rna"], sp)
+    assert DeviationLoss([g], torch.ones(BINS)).space == "untransformed"
+    out = run(
+        tmp_path,
+        rna_data,
+        "default_space",
+        dev_params(tmp_path, rna_data, 0.5, epochs=1),
+    )
+    setup = json.loads((out / "deviation_loss_setup.json").read_text())
+    assert setup["space"] == "untransformed"
+
+
+def test_untransform_gradients_are_finite_without_clip_soft():
+    y = torch.zeros(1, 2, 8, requires_grad=True)
+    out = untransform(
+        y, torch.ones(2), torch.tensor([float("inf"), 2.0]), torch.tensor([True, True])
+    )
+    out.sum().backward()
+    assert torch.isfinite(y.grad).all()
+    # above the soft clip the inverse matches cs - 1 + (y - cs + 1)^2 before the sqrt inverse
+    v = torch.tensor([[[3.0]]])
+    expected = ((2.0 - 1 + (3.0 - 2.0 + 1) ** 2) + 1) ** 2 - 1
+    assert torch.isclose(
+        untransform(v, torch.ones(1), torch.tensor([2.0]), torch.tensor([True])),
+        torch.tensor(expected),
+    ).all()

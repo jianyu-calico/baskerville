@@ -255,6 +255,22 @@ def main(argv=None):
             cross=args.cross,
         )
 
+    if meta_data is not None and eval_data:
+        # the windows that steer the weights must not also pick the epoch
+        stop = eval_data[0]
+        stop_idx = set(
+            stop.indices
+            if isinstance(stop, torch.utils.data.Subset)
+            else range(len(stop))
+        )
+        meta_idx = set(loss_weights.rows_in_bed(meta_data, meta["bed"]).tolist())
+        overlap = stop_idx & meta_idx
+        if overlap:
+            parser.error(
+                f"{len(overlap)} meta_valid windows are in the early-stopping set; "
+                "restrict it with train.early_stop_valid (chroms, bed or exclude_bed)"
+            )
+
     seqnn_trainer = trainer.Trainer(
         params["train"],
         train_data,

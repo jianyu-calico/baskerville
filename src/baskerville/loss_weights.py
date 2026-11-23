@@ -392,8 +392,10 @@ def project_weights(weights, bin_counts, lo: float, hi: float, iters: int = 60):
 
     Per group, finds the factor s with mean(clip(s * w, lo, hi)) = 1 by bisection
     (the mean is monotone in s), so both conditions hold at once, unlike a single
-    clip followed by rescaling. Needs lo <= 1 <= hi. Works on numpy arrays and torch
-    tensors (no gradient through the result).
+    clip followed by rescaling. Zero (or negative) weights end at ``lo``. Raises when
+    a group can't reach mean 1 within the bounds (lo <= 1 <= hi is necessary; with
+    zero weights, hi on the positive classes must suffice). Works on numpy arrays and
+    torch tensors (no gradient through the result).
     """
     if not lo <= 1.0 <= hi:
         raise ValueError("project_weights needs lo <= 1 <= hi")
@@ -408,16 +410,26 @@ def project_weights(weights, bin_counts, lo: float, hi: float, iters: int = 60):
     out = np.empty_like(w)
     for g in range(w.shape[1]):
         col = np.maximum(w[:, g], 0.0)
+        positive = (col > 0) & (p > 0)
+        if not positive.any():
+            raise ValueError(
+                f"project_weights: group {g} has no positive weight on training bins"
+            )
+        top = float((np.where(positive, hi, lo) * p).sum())  # the mean as s -> infinity
+        if top < 1.0 - 1e-12:
+            raise ValueError(
+                f"project_weights: group {g} can't reach mean 1 within [{lo}, {hi}] "
+                f"(at most {top:.4g} with its zero weights at lo)"
+            )
 
-        def mean_at(s):
+        def mean_at(s, col=col):
             return float((np.clip(s * col, lo, hi) * p).sum())
 
-        if mean_at(0.0) >= 1.0 or not (col * p).sum() > 0:
-            out[:, g] = np.clip(np.where(col > 0, 1.0, lo), lo, hi)  # degenerate column
-            continue
         a, b = 0.0, 1.0
         while mean_at(b) < 1.0:
             b *= 2.0
+            if b > 1e300:
+                raise ValueError(f"project_weights: no scale found for group {g}")
         for _ in range(iters):
             mid = (a + b) / 2
             a, b = (mid, b) if mean_at(mid) < 1.0 else (a, mid)

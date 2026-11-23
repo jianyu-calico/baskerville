@@ -80,6 +80,7 @@ def params_for(
                 "kernel_size": 3,
                 "gated": True,
                 "dropout": dropout,
+                "layer_scale": 0,  # full residual branch, so dropout matters
             }
         )
     p["train"].update({"seed": 3, "mix_dtype": dtype, **train})
@@ -88,11 +89,9 @@ def params_for(
     bed, tsv = classes(tmp_path, data_dir, table)
     lw = {"bin_classes": str(bed), "class_weights": str(tsv), "default_class": "bg"}
     if meta:
-        lw["meta_valid"] = {
-            "bed": str(meta_bed(tmp_path, data_dir)),
-            "batch_size": 2,
-            "seed": 5,
-        }
+        mb = str(meta_bed(tmp_path, data_dir))
+        lw["meta_valid"] = {"bed": mb, "batch_size": 2, "seed": 5}
+        p["train"]["early_stop_valid"] = {"exclude_bed": mb}
     if hook:
         lw["hook"] = hook
     p["train"]["loss_weights"] = lw
@@ -199,7 +198,7 @@ class CheckPrimitives:
         before = {k: v.clone() for k, v in trainer.model.state_dict().items()}
         rng = torch.get_rng_state()
         hook = GradientAlignmentHook()
-        direction, _, _ = hook.val_direction(trainer, 1)
+        direction, *_ = hook.val_direction(trainer, 1)
         a = trainer.forward(batch, rng_seed=7)
         trainer.perturb_params(direction, 0.01)
         trainer.forward(batch, rng_seed=7)
@@ -234,56 +233,53 @@ def test_primitives_leave_params_buffers_and_rng_unchanged(tmp_path, data_dir):
 
 
 class CompareAlignment:
-    """At step 1: the hook's finite-difference alignment and the exact one."""
+    """At step 1: the hook's finite-difference alignment and the exact one, on the
+    same dropout masks (the hook's FD seed) and in the same precision."""
 
     result = None
-    dtype = torch.float32
+    dtype = "float32"
     eps = 1e-3
 
     def before_step(self, trainer, batch, di):
         if trainer._step != 1:
             return
-        saved, trainer.mix_dtype = trainer.mix_dtype, CompareAlignment.dtype
-        hook = GradientAlignmentHook(eps=CompareAlignment.eps)
-        direction, _, _ = hook.val_direction(trainer, 1)
+        hook = GradientAlignmentHook(
+            eps=CompareAlignment.eps, fd_dtype=CompareAlignment.dtype
+        )
+        dtype = hook.resolved_fd_dtype(trainer)
+        direction, *_ = hook.val_direction(trainer, 1)
         W = trainer.class_weights[0]
         a_fd = hook.alignment(trainer, batch, direction, 1, W)
         Wl = W.detach().clone().requires_grad_(True)
         params = trainer.trainable_params()
-        y = trainer.forward(batch, rng_seed=0, grad=True)
-        g = torch.autograd.grad(
-            trainer.loss_from_pred(y, batch, Wl), params, create_graph=True
-        )
+        y = trainer.forward(batch, rng_seed=hook.fd_seed(1), grad=True, dtype=dtype)
+        loss = trainer.loss_from_pred(y, batch, Wl, dtype=dtype)
+        g = torch.autograd.grad(loss, params, create_graph=True)
         s = sum((gi * dir_).sum() for gi, dir_ in zip(g, direction))
         (a_exact,) = torch.autograd.grad(s, Wl)
         CompareAlignment.result = (a_fd.flatten(), a_exact.detach().flatten())
-        trainer.mix_dtype = saved
 
 
 @pytest.mark.parametrize(
-    "dtype, eps, min_corr",
+    "dtype, eps, dropout, min_corr",
     [
-        (torch.float32, 1e-3, 0.9999),
-        # bf16 needs a larger step: tiny model corr 0.21 / 0.85 / 0.99 at eps 1e-3 / 1e-2 / 1e-1
-        (torch.bfloat16, 1e-1, 0.98),
+        ("float32", 1e-3, 0.0, 0.9999),
+        ("float32", 1e-3, 0.3, 0.9999),  # +eps / -eps share dropout masks
+        ("auto", 1e-3, 0.3, 0.9999),  # auto = float32 FD under bf16 training
+        # bf16 FD needs a larger step: tiny model corr 0.21 / 0.85 / 0.99 at eps 1e-3 / 1e-2 / 1e-1
+        ("bfloat16", 1e-1, 0.0, 0.98),
     ],
 )
 def test_finite_difference_alignment_matches_exact(
-    tmp_path, data_dir, dtype, eps, min_corr
+    tmp_path, data_dir, dtype, eps, dropout, min_corr
 ):
     CompareAlignment.result = None
     CompareAlignment.dtype, CompareAlignment.eps = dtype, eps
     hook = hook_spec(f"{__name__}:CompareAlignment")
-    run(
-        tmp_path,
-        data_dir,
-        f"fd_{eps}",
-        params_for(tmp_path, data_dir, hook=hook, epochs=1),
-    )
+    params = params_for(tmp_path, data_dir, hook=hook, epochs=1, dropout=dropout)
+    run(tmp_path, data_dir, f"fd_{dtype}_{dropout}", params)
     fd, exact = CompareAlignment.result
     corr = float(torch.corrcoef(torch.stack([fd.float(), exact.float()]))[0, 1])
-    sign = float((torch.sign(fd) == torch.sign(exact)).float().mean())
-    print("FD", dtype, eps, "corr", round(corr, 6), "sign", sign)
     assert corr > min_corr
 
 
@@ -432,7 +428,9 @@ def test_fd_scan_logs_and_leaves_training_unchanged(tmp_path, data_dir):
     first = log[log["precision"] == "float32"].groupby("update").head(1)
     assert np.allclose(first.corr_vs_ref, 1.0)
     refs = log[(log.precision == "float32") & (log.rel == 1e-4)]
-    assert (refs.corr_vs_ref > 0.999).all()  # converged fp32 references agree
+    assert (
+        refs.corr_vs_ref > 0.99
+    ).all()  # fp32 references agree (0.998 with dropout here)
 
 
 def test_init_model_starts_from_given_weights_with_a_fresh_optimizer(
@@ -448,3 +446,162 @@ def test_init_model_starts_from_given_weights_with_a_fresh_optimizer(
     assert all(torch.equal(best[k], ck["model"][k]) for k in params)  # lr 0: unchanged
     steps = {float(s["step"]) for s in ck["optimizer"]["state"].values()}
     assert steps == {2.0}  # a fresh optimizer: only this run's 2 steps
+
+
+# -- follow-up to the hook check (2026-11-23) -------------------------------------
+
+ALIGN = "baskerville.online_weights:GradientAlignmentHook"
+
+
+def test_update_moves_weights_toward_positive_alignment(tmp_path, data_dir):
+    """A flipped update sign fails here: within each group, the hot/bg weight ratio
+    must move in the direction of a[hot] - a[bg]."""
+    spec = hook_spec(ALIGN, eta=0.1, every=1, lo=0.01, hi=100.0)
+    out = run(
+        tmp_path, data_dir, "sign", params_for(tmp_path, data_dir, hook=spec, epochs=1)
+    )
+    start = pd.read_csv(out / "class_weights_ds0.tsv", sep="\t")
+    row = pd.read_csv(out / "online_weights.tsv", sep="\t").iloc[0]
+    checked = 0
+    for gi, g in enumerate(["rna", "dnase", "chip"]):
+        old = np.log(start[f"weight_{g}"][1] / start[f"weight_{g}"][0])
+        new = np.log(row[f"w[1,{gi}]"] / row[f"w[0,{gi}]"])
+        da = row[f"a[1,{gi}]"] - row[f"a[0,{gi}]"]
+        if abs(da) > 1e-12:
+            assert np.sign(new - old) == np.sign(da)
+            checked += 1
+    assert checked >= 2
+
+
+def test_fd_check_is_logged_and_can_abort(tmp_path, data_dir):
+    out = run(
+        tmp_path,
+        data_dir,
+        "check",
+        params_for(
+            tmp_path, data_dir, hook=hook_spec(ALIGN, eta=0.1, every=1), epochs=1
+        ),
+    )
+    ratio = pd.read_csv(out / "online_weights.tsv", sep="\t").fd_check_ratio
+    assert np.allclose(ratio, 1.0, atol=0.02)  # fp32 FD resolves L_val's derivative
+    strict = hook_spec(ALIGN, eta=0.1, every=1, check_tol=-1.0, check_action="abort")
+    with pytest.raises(RuntimeError, match="finite difference isn't resolved"):
+        run(
+            tmp_path,
+            data_dir,
+            "abort",
+            params_for(tmp_path, data_dir, hook=strict, epochs=1),
+        )
+
+
+def test_non_finite_updates_are_skipped(tmp_path, data_dir, monkeypatch):
+    def nan_alignment(
+        self, trainer, batch, direction, step, weights, eps=None, dtype=None
+    ):
+        return torch.full_like(weights, float("nan"))
+
+    monkeypatch.setattr(GradientAlignmentHook, "alignment", nan_alignment)
+    with pytest.warns(UserWarning, match="update skipped"):
+        out = run(
+            tmp_path,
+            data_dir,
+            "nan",
+            params_for(
+                tmp_path,
+                data_dir,
+                hook=hook_spec(ALIGN, eta=0.5, every=1, check=False),
+                epochs=1,
+            ),
+        )
+    log = pd.read_csv(out / "online_weights.tsv", sep="\t")
+    assert (log.skipped == 1).all()
+    ck = torch.load(out / "checkpoint.pth", map_location="cpu")
+    start = pd.read_csv(out / "class_weights_ds0.tsv", sep="\t")
+    expected = start[["weight_rna", "weight_dnase", "weight_chip"]].to_numpy()
+    assert np.allclose(ck["class_weights"][0].numpy(), expected)  # unchanged
+    assert ck["hook_state"]["scale"] is None and ck["hook_state"]["skipped"] == 2
+
+
+def test_precondition_warns_without_second_moments(tmp_path, data_dir):
+    spec = hook_spec(ALIGN, eta=0.1, every=1, precondition=True)
+    with pytest.warns(UserWarning, match="exp_avg_sq are missing"):
+        run(
+            tmp_path,
+            data_dir,
+            "precond",
+            params_for(tmp_path, data_dir, hook=spec, epochs=1),
+        )
+
+
+def test_projection_zero_weights_and_impossible_bounds():
+    counts = np.array([50, 50])
+    out = project_weights(np.array([[0.0], [3.0]]), counts, 0.2, 5.0)
+    assert np.isclose(out[0, 0], 0.2) and np.isclose(
+        (out[:, 0] * [0.5, 0.5]).sum(), 1.0
+    )
+    with pytest.raises(ValueError, match="can't reach mean 1"):
+        project_weights(
+            np.array([[0.0], [3.0]]), counts, 0.2, 1.5
+        )  # 0.5*0.2 + 0.5*1.5 < 1
+    with pytest.raises(ValueError, match="no positive weight"):
+        project_weights(np.array([[0.0], [0.0]]), counts, 0.2, 5.0)
+
+
+def test_meta_windows_in_the_early_stopping_set_raise(tmp_path, data_dir):
+    p = params_for(
+        tmp_path, data_dir, hook=hook_spec(ALIGN, eta=0.1, every=1), epochs=1
+    )
+    del p["train"]["early_stop_valid"]
+    with pytest.raises(SystemExit):
+        run(tmp_path, data_dir, "overlap", p)
+
+
+def test_resume_drops_log_rows_written_after_the_checkpoint(tmp_path, data_dir):
+    spec = hook_spec(ALIGN, eta=0.5, every=1)
+    run(tmp_path, data_dir, "logs", params_for(tmp_path, data_dir, hook=spec, epochs=1))
+    out = tmp_path / "logs"
+    # a preempted second epoch: rows written after the epoch-1 checkpoint
+    for name, col, value in (
+        ("online_weights.tsv", "step", 2),
+        ("meta_valid.tsv", "epoch", 1),
+    ):
+        log = pd.read_csv(out / name, sep="\t")
+        extra = log.tail(1).copy()
+        extra[col] = value
+        pd.concat([log, extra]).to_csv(out / name, sep="\t", index=False)
+    run(tmp_path, data_dir, "logs", params_for(tmp_path, data_dir, hook=spec, epochs=2))
+    steps = pd.read_csv(out / "online_weights.tsv", sep="\t").step.tolist()
+    epochs = pd.read_csv(out / "meta_valid.tsv", sep="\t").epoch.tolist()
+    assert steps == [0, 1, 2, 3] and epochs == [0, 1]
+
+
+def test_primitives_with_batchnorm_in_checkpointed_blocks(tmp_path, data_dir):
+    CheckPrimitives.ok = None
+    p = params_for(
+        tmp_path, data_dir, hook=hook_spec(f"{__name__}:CheckPrimitives"), epochs=1
+    )
+    p["model"]["trunk"][1]["grad_checkpoint"] = True
+    run(tmp_path, data_dir, "ckpt_bn", p)
+    assert CheckPrimitives.ok is True, CheckPrimitives.detail
+
+
+def test_frozen_norm_stats_covers_cond_batchnorm():
+    from baskerville.condnorm import CondBatchNorm1d
+    from baskerville.trainer import Trainer
+
+    class Holder:
+        model = torch.nn.ModuleList([CondBatchNorm1d(2, 4), torch.nn.BatchNorm1d(4)])
+
+    h = Holder()
+    h.model.train()
+    before = {k: v.clone() for k, v in h.model.state_dict().items()}
+    x = torch.randn(3, 4, 5) * 3 + 1
+    with Trainer.frozen_norm_stats(h):
+        h.model[0](x, 1)
+        h.model[1](x)
+    after = h.model.state_dict()
+    assert all(torch.equal(before[k], after[k]) for k in before)
+    h.model[0](x, 1)  # outside the block, stats move
+    assert not torch.equal(
+        before["0.running_mean"], h.model.state_dict()["0.running_mean"]
+    )

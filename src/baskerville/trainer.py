@@ -1,3 +1,4 @@
+import contextlib
 import dataclasses
 import datetime
 import gc
@@ -547,46 +548,81 @@ class Trainer:
         y iterate, where gradients are taken)."""
         return [p for p in self.model.parameters() if p.requires_grad]
 
-    def forward(self, batch, *, rng_seed: int, grad: bool = False, di: int = 0):
-        """Model coverage predictions for ``batch`` under the training autocast, in
-        training mode (batch-stat BatchNorm, dropout) without touching BatchNorm
-        running stats (``track_running_stats`` is off for the call), with the
-        dropout RNG seeded by ``rng_seed`` (identical masks for identical seeds) and
-        the global RNG state left untouched."""
-        batch = self.to_device(batch)
-        hi = di if self.model_heads is None else self.model_heads
+    @contextlib.contextmanager
+    def frozen_norm_stats(self):
+        """Within the block, forwards (and backward recomputation of checkpointed
+        blocks) leave BatchNorm running stats as they were: torch BatchNorm layers
+        get ``track_running_stats`` off (batch statistics, no buffer writes, nothing
+        for autograd to see change); CondBatchNorm layers, which update their stats
+        outside autograd regardless, are snapshot and restored on exit."""
+        from baskerville.condnorm import _CondNormBase  # noqa: PLC0415
+
         norms = [
             m
             for m in self.model.modules()
             if isinstance(m, torch.nn.modules.batchnorm._BatchNorm)
             and m.track_running_stats
         ]
-        devices = [torch.cuda.current_device()] if self.device == "cuda" else []
+        cond = [
+            (
+                m,
+                {
+                    k: v.clone()
+                    for k, v in m.named_buffers(recurse=False)
+                    if v is not None
+                },
+            )
+            for m in self.model.modules()
+            if isinstance(m, _CondNormBase)
+        ]
         try:
             for m in norms:
                 m.track_running_stats = False
-            with torch.random.fork_rng(devices=devices):
-                torch.manual_seed(rng_seed)
-                with (
-                    torch.set_grad_enabled(grad),
-                    torch.autocast(device_type=self.device, dtype=self.mix_dtype),
-                ):
-                    x = batch.sequence
-                    if self.mix_dtype == torch.float32:
-                        x = x.float()  # no autocast: match the parameters' dtype
-                    yh = self.model(
-                        x,
-                        hi,
-                        di=self.model_di,
-                        gene_out_mask=batch.gene_out_mask,
-                        gene_presence=batch.gene_presence,
-                    ).coverage
+            yield
         finally:
             for m in norms:
                 m.track_running_stats = True
+            with torch.no_grad():
+                for m, saved in cond:
+                    for k, v in saved.items():
+                        getattr(m, k).copy_(v)
+
+    def forward(
+        self, batch, *, rng_seed: int, grad: bool = False, di: int = 0, dtype=None
+    ):
+        """Model coverage predictions for ``batch`` in training mode (batch-stat
+        BatchNorm, dropout) under ``frozen_norm_stats``, with the dropout RNG seeded
+        by ``rng_seed`` (identical masks for identical seeds) and the global RNG
+        state left untouched. ``dtype`` overrides the autocast dtype (float32: no
+        autocast, full precision). For a backward through gradient-checkpointed
+        blocks, run forward and backward inside ``frozen_norm_stats``."""
+        batch = self.to_device(batch)
+        hi = di if self.model_heads is None else self.model_heads
+        dtype = self.mix_dtype if dtype is None else dtype
+        devices = [torch.cuda.current_device()] if self.device == "cuda" else []
+        with self.frozen_norm_stats(), torch.random.fork_rng(devices=devices):
+            torch.manual_seed(rng_seed)
+            with (
+                torch.set_grad_enabled(grad),
+                torch.autocast(
+                    device_type=self.device, dtype=dtype, enabled=dtype != torch.float32
+                ),
+            ):
+                x = batch.sequence
+                if dtype == torch.float32:
+                    x = x.float()  # no autocast: match the parameters' dtype
+                yh = self.model(
+                    x,
+                    hi,
+                    di=self.model_di,
+                    gene_out_mask=batch.gene_out_mask,
+                    gene_presence=batch.gene_presence,
+                ).coverage
         return yh
 
-    def loss_from_pred(self, y_pred, batch, class_weights=None, di: int = 0):
+    def loss_from_pred(
+        self, y_pred, batch, class_weights=None, di: int = 0, dtype=None
+    ):
         """The training loss for ``y_pred`` (same normalizers, target, position, bin
         and sample weights, plus lambda * L_dev when on), with bin weights looked up
         from ``class_weights`` (default: the current table), which may require grad."""
@@ -600,7 +636,10 @@ class Trainer:
             bin_w = cw[labels, 0] if tg is None else cw[:, tg][labels].permute(0, 2, 1)
         if self.sample_weights[di] is not None:
             sample_w = self.sample_weights[di][batch.seq_index]
-        with torch.autocast(device_type=self.device, dtype=self.mix_dtype):
+        dtype = self.mix_dtype if dtype is None else dtype
+        with torch.autocast(
+            device_type=self.device, dtype=dtype, enabled=dtype != torch.float32
+        ):
             loss = self.loss_fn(
                 y_pred,
                 y,
@@ -614,11 +653,14 @@ class Trainer:
                 )
         return loss
 
-    def val_objective(self, y_pred, batch, di: int = 0):
+    def val_objective(self, y_pred, batch, di: int = 0, dtype=None):
         """L_pmn with uniform weights + meta_valid.dev_lambda * L_dev."""
         batch = self.to_device(batch)
         y = batch.coverage_targets.float()
-        with torch.autocast(device_type=self.device, dtype=self.mix_dtype):
+        dtype = self.mix_dtype if dtype is None else dtype
+        with torch.autocast(
+            device_type=self.device, dtype=dtype, enabled=dtype != torch.float32
+        ):
             loss = self.loss_fn(y_pred, y, self.target_weights[di])
             if self.meta_dev_lambda > 0:
                 loss = loss + self.meta_dev_lambda * self.dev_module(
@@ -1106,7 +1148,22 @@ class Trainer:
                 self.hook.load_state_dict(state["hook_state"])
         elif self.hook is not None and hasattr(self.hook, "on_train_start"):
             self.hook.on_train_start(self)
+        if epoch_start > 0:
+            # drop log rows written after the checkpoint (a preempted epoch reruns)
+            self._truncate_log("online_weights.tsv", "step", self._step)
+            self._truncate_log("fd_scan.tsv", "step", self._step)
+            self._truncate_log("meta_valid.tsv", "epoch", epoch_start)
+            self._truncate_log("deviation_loss.tsv", "epoch", epoch_start)
         return epoch_start, valid_best, unimproved
+
+    def _truncate_log(self, name, column, limit):
+        """Keep only rows of out_dir/name with column < limit."""
+        path = f"{self.out_dir}/{name}"
+        if not os.path.exists(path):
+            return
+        log = pd.read_csv(path, sep="\t")
+        if column in log and (log[column] >= limit).any():
+            log[log[column] < limit].to_csv(path, sep="\t", index=False)
 
     def _log_epoch_cov(self, log_out, ei, n_eval_datasets):
         """Log per-dataset coverage metrics, append all of them to metrics.tsv,

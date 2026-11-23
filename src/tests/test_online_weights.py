@@ -605,3 +605,36 @@ def test_frozen_norm_stats_covers_cond_batchnorm():
     assert not torch.equal(
         before["0.running_mean"], h.model.state_dict()["0.running_mean"]
     )
+
+
+def test_resume_in_the_first_epoch_drops_its_log_rows(tmp_path, data_dir):
+    out = tmp_path / "first"
+    out.mkdir()
+    pd.DataFrame({"step": [0, 1], "x": [1, 2]}).to_csv(
+        out / "online_weights.tsv", sep="\t", index=False
+    )
+    pd.DataFrame({"epoch": [0], "meta_loss_pmn": [1.0]}).to_csv(
+        out / "meta_valid.tsv", sep="\t", index=False
+    )
+    spec = hook_spec(ALIGN, eta=0.1, every=1)
+    run(
+        tmp_path, data_dir, "first", params_for(tmp_path, data_dir, hook=spec, epochs=1)
+    )
+    log = pd.read_csv(out / "online_weights.tsv", sep="\t")
+    assert log.step.tolist() == [0, 1] and "x" not in log  # rewritten by this run only
+    assert pd.read_csv(out / "meta_valid.tsv", sep="\t").epoch.tolist() == [0]
+
+
+def test_init_model_does_not_override_a_checkpoint(tmp_path, data_dir):
+    other = run(
+        tmp_path, data_dir, "other", params_for(tmp_path, data_dir, meta=False, seed=9)
+    )
+    run(tmp_path, data_dir, "a", params_for(tmp_path, data_dir, meta=False, epochs=1))
+    run(tmp_path, data_dir, "b", params_for(tmp_path, data_dir, meta=False, epochs=1))
+    plain = run(
+        tmp_path, data_dir, "a", params_for(tmp_path, data_dir, meta=False, epochs=2)
+    )
+    p = params_for(tmp_path, data_dir, meta=False, epochs=2)
+    p["train"]["init_model"] = str(other / "model_best.pth")
+    resumed = run(tmp_path, data_dir, "b", p)  # out_dir has a checkpoint: resume wins
+    assert same(model_state(plain), model_state(resumed))

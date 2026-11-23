@@ -1148,12 +1148,12 @@ class Trainer:
                 self.hook.load_state_dict(state["hook_state"])
         elif self.hook is not None and hasattr(self.hook, "on_train_start"):
             self.hook.on_train_start(self)
-        if epoch_start > 0:
-            # drop log rows written after the checkpoint (a preempted epoch reruns)
-            self._truncate_log("online_weights.tsv", "step", self._step)
-            self._truncate_log("fd_scan.tsv", "step", self._step)
-            self._truncate_log("meta_valid.tsv", "epoch", epoch_start)
-            self._truncate_log("deviation_loss.tsv", "epoch", epoch_start)
+        # drop log rows written after the checkpoint (a preempted epoch reruns; with
+        # no checkpoint, rows from a preempted first epoch go)
+        self._truncate_log("online_weights.tsv", "step", self._step)
+        self._truncate_log("fd_scan.tsv", "step", self._step)
+        self._truncate_log("meta_valid.tsv", "epoch", epoch_start)
+        self._truncate_log("deviation_loss.tsv", "epoch", epoch_start)
         return epoch_start, valid_best, unimproved
 
     def _truncate_log(self, name, column, limit):
@@ -1163,7 +1163,11 @@ class Trainer:
             return
         log = pd.read_csv(path, sep="\t")
         if column in log and (log[column] >= limit).any():
-            log[log[column] < limit].to_csv(path, sep="\t", index=False)
+            keep = log[log[column] < limit]
+            if keep.empty:
+                os.remove(path)  # the next row writes a fresh header
+            else:
+                keep.to_csv(path, sep="\t", index=False)
 
     def _log_epoch_cov(self, log_out, ei, n_eval_datasets):
         """Log per-dataset coverage metrics, append all of them to metrics.tsv,

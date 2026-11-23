@@ -19,7 +19,11 @@ float32 when training uses bf16/fp16 autocast, because bf16 outputs (relative ul
 The step is ``eps`` (absolute) or ``eps_rel * ||theta||`` (recomputed each update).
 Each update also checks the finite difference against the exact gradient: the FD
 derivative of L_val along the direction must match g_val . direction (``check_tol``
-relative; ``check_action`` "warn" or "abort"). Non-finite updates are skipped.
+relative; ``check_action`` "warn" or "abort"). The check probes along g_val's own
+direction on the meta batch, so it is necessary, not sufficient, for an accurate
+alignment on the training batch; with a bf16 g_val the ratio can drift. Keep
+``check_action="warn"`` until it is calibrated at the model size used. Non-finite
+updates are skipped.
 ``fd_scan = {rel, ref_rel, every_updates}`` logs, on every N-th update, the alignment
 at several steps in fp32 and in the training precision (fd_scan.tsv), without
 affecting training.

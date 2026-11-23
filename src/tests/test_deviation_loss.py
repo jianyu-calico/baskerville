@@ -12,6 +12,7 @@ from baskerville.deviation_loss import (
     DeviationLoss,
     assay_groups,
     deviation_from_logs,
+    estimate_denominators,
     untransform,
 )
 from baskerville.loss_weights import RegionClassMap
@@ -434,9 +435,6 @@ def test_matches_independent_reference(space):
         untr if space == "untransformed" else None,
     )
     assert np.isclose(float(loss(yhat, y, mask)), ref, rtol=1e-5)
-    # the weights must come from targets: swapping in other predictions changes L but not w
-    w1 = loss.unit_weights(*loss.sample_unit_sums(y, mask, 0), 0)
-    assert torch.equal(w1, loss.unit_weights(*loss.sample_unit_sums(y, mask, 0), 0))
 
 
 def test_strand_partners_are_summed_before_the_log():
@@ -468,7 +466,11 @@ def test_untransform_matches_baskerville():
 
 
 def test_validation_is_unchanged_with_lambda_positive(rna_data, tmp_path, monkeypatch):
-    """L_dev is computed for training batches only; validation uses the plain loss."""
+    """L_dev is computed for training batches only; validation uses the plain loss.
+
+    At learning rate 0 both runs keep the same model, so their validation loss and
+    metrics must match exactly, while the training loss differs by lambda * L_dev.
+    """
     calls = {"n": 0}
     orig = DeviationLoss.forward
 
@@ -477,27 +479,52 @@ def test_validation_is_unchanged_with_lambda_positive(rna_data, tmp_path, monkey
         return orig(self, *args)
 
     monkeypatch.setattr(DeviationLoss, "forward", counting)
-    out = run(tmp_path, rna_data, "val", dev_params(tmp_path, rna_data, 0.5, epochs=1))
-    # 4 training windows, batch 2 -> 2 training steps; validation (4 windows) adds none
+    logs = {}
+    for name, lam in (("val_off", 0.0), ("val_on", 0.5)):
+        params = dev_params(tmp_path, rna_data, lam, epochs=1)
+        params["train"]["learning_rate"] = 0.0
+        out = run(tmp_path, rna_data, name, params)
+        logs[name] = pd.read_csv(out / "metrics.tsv", sep="\t")
+    # 4 training windows, batch 2 -> 2 training steps; validation adds no L_dev calls
     assert calls["n"] == 2
-    log = pd.read_csv(out / "deviation_loss.tsv", sep="\t")
-    assert len(log) == 1
+
+    def values(df, split):
+        rows = df[df.split == split].sort_values(["metric", "group"])
+        return rows.set_index(["metric", "group"])["value"]
+
+    off, on = logs["val_off"], logs["val_on"]
+    pd.testing.assert_series_equal(values(off, "valid"), values(on, "valid"))
+    assert values(on, "train")[("loss", "all")] > values(off, "train")[("loss", "all")]
 
 
 def test_denominators_do_not_depend_on_the_training_seed(rna_data, tmp_path):
+    # precondition: one-window estimates differ between sampling seeds, so a
+    # trainer that passed its training seed to the sampler would fail below
+    bed = gene_bed(tmp_path, rna_data)
+    ds = SeqDataset(
+        str(rna_data),
+        "train",
+        mode="train",
+        fold=0,
+        unit_map=RegionClassMap.unit_map(bed, ["gene_var", "gene_const"]),
+    )
+    cells = pd.read_csv(cell_type_table(tmp_path), sep="\t")
+    groups = assay_groups(ds.targets_df, cells, ["rna"], ds.strand_pair)
+    # a high threshold keeps w_k below 1, so weight sums vary between windows
+    probe = DeviationLoss(groups, torch.ones(BINS), threshold=1000.0)
+    by_seed = {s: estimate_denominators(probe, ds, 1, seed=s) for s in range(1, 9)}
+    seeds = [s for s in by_seed if by_seed[s] != by_seed[1]]
+    assert seeds, "toy windows must differ in their weight sums"
+    s2 = seeds[0]
+
     outs = []
-    for seed in (1, 2):
+    for seed in (1, s2):
         params = dev_params(tmp_path, rna_data, 0.5, epochs=1)
         params["train"]["seed"] = seed
-        params["train"]["deviation_loss"]["denominator_windows"] = 3
-        outs.append(
-            json.loads(
-                (
-                    run(tmp_path, rna_data, f"s{seed}", params)
-                    / "deviation_loss_setup.json"
-                ).read_text()
-            )
-        )
+        params["train"]["deviation_loss"]["denominator_windows"] = 1
+        params["train"]["deviation_loss"]["threshold"] = 1000.0
+        out = run(tmp_path, rna_data, f"s{seed}", params)
+        outs.append(json.loads((out / "deviation_loss_setup.json").read_text()))
     assert outs[0]["denominators"] == outs[1]["denominators"]
     assert outs[0]["denominators_estimated"] is True
     params = dev_params(tmp_path, rna_data, 0.5, epochs=1)

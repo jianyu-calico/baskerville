@@ -367,3 +367,84 @@ def test_early_stopping_subset_excludes_meta_windows(tmp_path, data_dir):
         valid.seqs_bed.chrom.iloc[valid.seq_indexes[i]] == "chr1" for i in chrom.indices
     )
     assert hound_train.early_stop_subset(valid, {}) is valid
+
+
+# -- eps_rel, fd_scan, init_model (requests of 2026-11-23) -----------------------
+
+
+def test_relative_step_follows_the_parameter_norm(tmp_path, data_dir):
+    class Fake:
+        def __init__(self, scale):
+            self.p = [torch.full((4,), scale), torch.full((5,), scale)]
+
+        def trainable_params(self):
+            return self.p
+
+    hook = GradientAlignmentHook(eps=0.5, eps_rel=1e-3)
+    assert np.isclose(hook.step_size(Fake(1.0)), 1e-3 * 3.0)  # ||theta|| = 3
+    assert np.isclose(hook.step_size(Fake(2.0)), 1e-3 * 6.0)
+    assert GradientAlignmentHook(eps=0.5).step_size(Fake(1.0)) == 0.5
+    spec = hook_spec(
+        "baskerville.online_weights:GradientAlignmentHook",
+        eta=0.5,
+        every=1,
+        eps_rel=1e-3,
+    )
+    out = run(tmp_path, data_dir, "rel", params_for(tmp_path, data_dir, hook=spec))
+    eps = pd.read_csv(out / "online_weights.tsv", sep="\t").eps
+    assert (eps > 0).all() and eps.nunique() > 1  # recomputed as the parameters move
+
+
+def test_fd_scan_logs_and_leaves_training_unchanged(tmp_path, data_dir):
+    base = dict(eta=0.5, every=1, eps_rel=1e-2)
+    plain = run(
+        tmp_path,
+        data_dir,
+        "plain",
+        params_for(
+            tmp_path,
+            data_dir,
+            hook=hook_spec("baskerville.online_weights:GradientAlignmentHook", **base),
+            dropout=0.3,
+        ),
+    )
+    scan = {"rel": [1e-3, 1e-2], "ref_rel": [1e-5, 1e-4], "every_updates": 2}
+    scanned = run(
+        tmp_path,
+        data_dir,
+        "scan",
+        params_for(
+            tmp_path,
+            data_dir,
+            hook=hook_spec(
+                "baskerville.online_weights:GradientAlignmentHook", fd_scan=scan, **base
+            ),
+            dropout=0.3,
+        ),
+    )
+    a = torch.load(plain / "checkpoint.pth", map_location="cpu")
+    b = torch.load(scanned / "checkpoint.pth", map_location="cpu")
+    assert same(a["model"], b["model"])
+    assert torch.equal(a["class_weights"][0], b["class_weights"][0])
+    log = pd.read_csv(scanned / "fd_scan.tsv", sep="\t")
+    assert sorted(log["update"].unique()) == [0, 2]  # every 2nd of 4 updates
+    assert len(log) == 2 * 4  # 2 fp32 refs + 2 bf16 steps per scanned update
+    first = log[log["precision"] == "float32"].groupby("update").head(1)
+    assert np.allclose(first.corr_vs_ref, 1.0)
+    refs = log[(log.precision == "float32") & (log.rel == 1e-4)]
+    assert (refs.corr_vs_ref > 0.999).all()  # converged fp32 references agree
+
+
+def test_init_model_starts_from_given_weights_with_a_fresh_optimizer(
+    tmp_path, data_dir
+):
+    first = run(tmp_path, data_dir, "first", params_for(tmp_path, data_dir, meta=False))
+    p = params_for(tmp_path, data_dir, meta=False, epochs=1, learning_rate=0.0)
+    p["train"]["init_model"] = str(first / "model_best.pth")
+    second = run(tmp_path, data_dir, "second", p)
+    best = torch.load(first / "model_best.pth", map_location="cpu")
+    ck = torch.load(second / "checkpoint.pth", map_location="cpu")
+    params = [k for k in best if "running" not in k and "num_batches" not in k]
+    assert all(torch.equal(best[k], ck["model"][k]) for k in params)  # lr 0: unchanged
+    steps = {float(s["step"]) for s in ck["optimizer"]["state"].values()}
+    assert steps == {2.0}  # a fresh optimizer: only this run's 2 steps

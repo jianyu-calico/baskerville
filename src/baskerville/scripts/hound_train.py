@@ -226,6 +226,16 @@ def main(argv=None):
     # initialize model
     seqnn_model = seqnn.SeqNN(params["model"])
 
+    # optional start from given model weights with a fresh optimizer; a checkpoint
+    # in out_dir (resume) takes precedence when the trainer starts
+    init_model = params["train"].get("init_model")
+    if init_model and not os.path.exists(f"{args.out_dir}/checkpoint.pth"):
+        seqnn_model.restore(
+            init_model,
+            trunk_only=bool(params["train"].get("init_model_trunk_only", False)),
+        )
+        print(f"initialized model weights from {init_model}")
+
     # initialize trainer
     # meta-validation windows for online-reweighting hooks (valid split, with the
     # class and unit maps so hooks get bin labels and unit masks)

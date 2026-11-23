@@ -35,6 +35,30 @@ Train Hound model using given parameters and data.
 """
 
 
+def early_stop_subset(valid, train_params):
+    """The validation set used for early stopping: all of it, or the windows selected
+    by ``train_params["early_stop_valid"]`` = {chroms: [...]} and/or {bed: path,
+    exclude_bed: path} (rows matched by chrom start end in sequences.bed)."""
+    config = train_params.get("early_stop_valid") or {}
+    if not config:
+        return valid
+    keep = np.arange(len(valid))
+    if config.get("chroms"):
+        keep = np.intersect1d(
+            keep, loss_weights.rows_on_chroms(valid, config["chroms"])
+        )
+    if config.get("bed"):
+        keep = np.intersect1d(keep, loss_weights.rows_in_bed(valid, config["bed"]))
+    if config.get("exclude_bed"):
+        keep = np.intersect1d(
+            keep, loss_weights.rows_in_bed(valid, config["exclude_bed"], invert=True)
+        )
+    if len(keep) == 0:
+        raise ValueError("early_stop_valid selects no validation windows")
+    print(f"early stopping on {len(keep)} of {len(valid)} validation windows")
+    return torch.utils.data.Subset(valid, keep.tolist())
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Train a model.")
     parser.add_argument(
@@ -105,7 +129,8 @@ def main(argv=None):
     lw = params["train"].get("loss_weights", {}) or {}
     dev = params["train"].get("deviation_loss", {}) or {}
     unit_map = None
-    if float(dev.get("lambda", 0.0)) != 0:
+    meta = lw.get("meta_valid") or {}
+    if float(dev.get("lambda", 0.0)) != 0 or float(meta.get("dev_lambda", 0.0)) != 0:
         if len(args.data_dirs) > 1:
             parser.error("the deviation loss supports a single data directory")
         unit_map = loss_weights.RegionClassMap.unit_map(
@@ -171,17 +196,16 @@ def main(argv=None):
             )
 
             # load eval data
-            eval_data.append(
-                dataset.SeqDataset(
-                    data_dir,
-                    split_label="valid",
-                    mode="eval",
-                    extra_crop_bp=extra_crop_bp,
-                    extra_crop_bins=extra_crop_bins,
-                    fold=args.fold,
-                    cross=args.cross,
-                )
+            valid = dataset.SeqDataset(
+                data_dir,
+                split_label="valid",
+                mode="eval",
+                extra_crop_bp=extra_crop_bp,
+                extra_crop_bins=extra_crop_bins,
+                fold=args.fold,
+                cross=args.cross,
             )
+            eval_data.append(early_stop_subset(valid, params["train"]))
 
     ################################################################
 
@@ -203,6 +227,24 @@ def main(argv=None):
     seqnn_model = seqnn.SeqNN(params["model"])
 
     # initialize trainer
+    # meta-validation windows for online-reweighting hooks (valid split, with the
+    # class and unit maps so hooks get bin labels and unit masks)
+    meta_data = None
+    if meta:
+        if len(args.data_dirs) > 1 or args.whole:
+            parser.error("loss_weights.meta_valid needs one data directory, no --whole")
+        meta_data = dataset.SeqDataset(
+            args.data_dirs[0],
+            split_label="valid",
+            mode="eval",
+            class_map=class_map,
+            unit_map=unit_map,
+            extra_crop_bp=extra_crop_bp,
+            extra_crop_bins=extra_crop_bins,
+            fold=args.fold,
+            cross=args.cross,
+        )
+
     seqnn_trainer = trainer.Trainer(
         params["train"],
         train_data,
@@ -210,6 +252,7 @@ def main(argv=None):
         args.out_dir,
         checkpoint_callback=checkpoint_callback,
         prune_callback=prune_callback,
+        meta_data=meta_data,
     )
 
     # train

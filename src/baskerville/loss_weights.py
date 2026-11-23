@@ -384,3 +384,69 @@ def load_hook(spec: dict | None):
         return None
     module, _, name = spec["class"].partition(":")
     return getattr(importlib.import_module(module), name)(**spec.get("args", {}))
+
+
+def project_weights(weights, bin_counts, lo: float, hi: float, iters: int = 60):
+    """Map a (num_classes, num_groups) table onto {lo <= w <= hi, mean 1 over training
+    bins within each group}.
+
+    Per group, finds the factor s with mean(clip(s * w, lo, hi)) = 1 by bisection
+    (the mean is monotone in s), so both conditions hold at once, unlike a single
+    clip followed by rescaling. Needs lo <= 1 <= hi. Works on numpy arrays and torch
+    tensors (no gradient through the result).
+    """
+    if not lo <= 1.0 <= hi:
+        raise ValueError("project_weights needs lo <= 1 <= hi")
+    is_torch = hasattr(weights, "detach")
+    w = (
+        weights.detach().cpu().double().numpy()
+        if is_torch
+        else np.asarray(weights, float)
+    )
+    counts = np.asarray(bin_counts, dtype=float)
+    p = counts / counts.sum()
+    out = np.empty_like(w)
+    for g in range(w.shape[1]):
+        col = np.maximum(w[:, g], 0.0)
+
+        def mean_at(s):
+            return float((np.clip(s * col, lo, hi) * p).sum())
+
+        if mean_at(0.0) >= 1.0 or not (col * p).sum() > 0:
+            out[:, g] = np.clip(np.where(col > 0, 1.0, lo), lo, hi)  # degenerate column
+            continue
+        a, b = 0.0, 1.0
+        while mean_at(b) < 1.0:
+            b *= 2.0
+        for _ in range(iters):
+            mid = (a + b) / 2
+            a, b = (mid, b) if mean_at(mid) < 1.0 else (a, mid)
+        out[:, g] = np.clip(b * col, lo, hi)
+        out[:, g] /= (out[:, g] * p).sum()  # remove the bisection residue (~1e-18)
+        out[:, g] = np.clip(out[:, g], lo, hi)
+    if is_torch:
+        import torch  # noqa: PLC0415
+
+        return torch.tensor(out, dtype=weights.dtype, device=weights.device)
+    return out
+
+
+def rows_in_bed(ds, bed, invert: bool = False) -> np.ndarray:
+    """Example indexes of ``ds`` whose sequences.bed row (chrom, start, end) is listed
+    in ``bed`` (or, with ``invert``, is not)."""
+    table = pd.read_csv(bed, sep="\t", header=None, usecols=[0, 1, 2], comment="#")
+    keys = set(zip(table[0].astype(str), table[1].astype(int), table[2].astype(int)))
+    rows = ds.seqs_bed.iloc[ds.seq_indexes]
+    hit = np.array(
+        [
+            (c, int(s), int(e)) in keys
+            for c, s, e in zip(rows["chrom"], rows["start"], rows["end"])
+        ]
+    )
+    return np.flatnonzero(~hit if invert else hit)
+
+
+def rows_on_chroms(ds, chroms, invert: bool = False) -> np.ndarray:
+    """Example indexes of ``ds`` on (or, with ``invert``, off) the given chromosomes."""
+    on = ds.seqs_bed["chrom"].iloc[ds.seq_indexes].isin(set(chroms)).to_numpy()
+    return np.flatnonzero(~on if invert else on)

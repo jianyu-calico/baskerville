@@ -1,3 +1,4 @@
+import dataclasses
 import datetime
 import gc
 import json
@@ -88,6 +89,10 @@ class Trainer:
     class_weights: list = []
     sample_weights: list = []
     track_groups: list = []
+    class_bin_counts: list = []
+    meta_data = None
+    meta_loader = None
+    _param_backup = None
     dev_loss = None
     dev_lambda = 0.0
     _epoch = 0
@@ -104,8 +109,10 @@ class Trainer:
         checkpoint_callback=None,
         prune_callback=None,
         hook=None,
+        meta_data=None,
     ):
         self.params = params
+        self.meta_data = meta_data
         self.train_data = train_data
         self.eval_data = eval_data
         self.out_dir = out_dir
@@ -324,6 +331,7 @@ class Trainer:
 
         self._setup_loss_weights(hook)
         self._setup_deviation_loss()
+        self._setup_meta_validation()
 
     def _setup_loss_weights(self, hook):
         """Per-dataset class (bin) and sample weights, normalized to mean 1 over training.
@@ -338,11 +346,13 @@ class Trainer:
             hook if hook is not None else loss_weights.load_hook(config.get("hook"))
         )
         self.class_weights, self.sample_weights, self.track_groups = [], [], []
+        self.class_bin_counts = []
         for di, ds in enumerate(self.train_data):
             cw = sw = tg = None
             if getattr(ds, "class_map", None) is not None:
                 by_split = loss_weights.class_bin_counts_by_split(ds)
                 loss_weights.check_class_coverage(ds, by_split)
+                self.class_bin_counts.append(by_split["train"])
                 w = loss_weights.normalize_class_weights(
                     ds.class_map.class_weights, by_split["train"]
                 )
@@ -395,9 +405,11 @@ class Trainer:
         """
         config = self.params.get("deviation_loss", {}) or {}
         self.dev_lambda = float(config.get("lambda", 0.0))
-        self.dev_loss = None
+        meta = (self.params.get("loss_weights", {}) or {}).get("meta_valid") or {}
+        self.meta_dev_lambda = float(meta.get("dev_lambda", 0.0))
+        self.dev_loss = self.dev_module = None
         self._dev_sums = [0.0, 0.0, 0]  # coverage loss, L_dev, batches this epoch
-        if self.dev_lambda == 0:
+        if self.dev_lambda == 0 and self.meta_dev_lambda == 0:
             return
         if self.loss != "poisson_mn" or len(self.train_data) != 1:
             raise ValueError("deviation loss needs poisson_mn and one train dataset")
@@ -416,7 +428,7 @@ class Trainer:
             weight_range=self.weight_range, weight_exp=self.weight_exp
         )
         pw_loss._setup_position_weights(ds.target_length, "cpu")
-        self.dev_loss = deviation_loss.DeviationLoss(
+        self.dev_module = deviation_loss.DeviationLoss(
             groups,
             pw_loss.position_weights.flatten(),
             block_bins=int(config.get("block_bins", 4)),
@@ -433,27 +445,243 @@ class Trainer:
                 "put them in the config to skip this",
                 flush=True,
             )
-            denominators = deviation_loss.estimate_denominators(self.dev_loss, ds, n)
-        self.dev_loss.denominators = deviation_loss.per_assay(
+            denominators = deviation_loss.estimate_denominators(self.dev_module, ds, n)
+        self.dev_module.denominators = deviation_loss.per_assay(
             denominators, len(groups), "denominator"
         )
         with open(f"{self.out_dir}/deviation_loss_setup.json", "w") as f:
             json.dump(
                 {
                     "lambda": self.dev_lambda,
-                    "space": self.dev_loss.space,
+                    "space": self.dev_module.space,
                     "assays": [g.assay for g in groups],
                     "tracks": [len(g.tracks) for g in groups],
                     "samples": [g.sample_sums.shape[1] for g in groups],
                     "groups": [g.group_names for g in groups],
-                    "pseudocounts": self.dev_loss.pseudocounts,
-                    "thresholds": self.dev_loss.thresholds,
-                    "denominators": self.dev_loss.denominators,
+                    "pseudocounts": self.dev_module.pseudocounts,
+                    "thresholds": self.dev_module.thresholds,
+                    "denominators": self.dev_module.denominators,
                     "denominators_estimated": estimated,
                 },
                 f,
                 indent=2,
             )
+        # the training term only when lambda > 0; the module also serves val_objective
+        self.dev_loss = self.dev_module if self.dev_lambda > 0 else None
+
+    # -- online reweighting: meta-validation loader and primitives for hooks ----
+
+    def _setup_meta_validation(self):
+        """``params["loss_weights"]["meta_valid"]`` = {bed, batch_size, seed,
+        num_workers, dev_lambda}: a seeded, endlessly cycling loader over the meta
+        dataset's windows listed in ``bed`` (``chrom start end``), for online-
+        reweighting hooks (``next_meta_batch``). The meta dataset (valid split, with
+        class and unit maps) is built by hound_train. Its loss is logged per epoch
+        to meta_valid.tsv.
+        """
+        config = (self.params.get("loss_weights", {}) or {}).get("meta_valid")
+        self.meta_loader = None
+        self._meta_position = 0
+        if not config:
+            return
+        if self.meta_data is None:
+            raise ValueError(
+                "loss_weights.meta_valid needs a meta dataset (hound_train)"
+            )
+        ds = self.meta_data
+        indexes = loss_weights.rows_in_bed(ds, config["bed"])
+        if len(indexes) == 0:
+            raise ValueError(f"no meta-validation windows from {config['bed']}")
+        self.meta_indexes = indexes
+        self.meta_batch_size = int(config.get("batch_size", 2))
+        self.meta_seed = int(config.get("seed", 0))
+        self.meta_workers = int(config.get("num_workers", 0))
+        self._meta_iter = None
+
+    def _meta_batches(self, start: int):
+        """Batch index lists from position ``start`` on: each cycle over the meta
+        windows is a permutation seeded by (seed, cycle), so the stream depends only
+        on the seed and the position (not on workers or resuming)."""
+        n = len(self.meta_indexes)
+        per_cycle = max(n // self.meta_batch_size, 1)
+        pos = start
+        while True:
+            cycle, k = divmod(pos, per_cycle)
+            order = np.random.default_rng([self.meta_seed, cycle]).permutation(n)
+            sel = order[k * self.meta_batch_size : (k + 1) * self.meta_batch_size]
+            yield [int(self.meta_indexes[i]) for i in sel]
+            pos += 1
+
+    def next_meta_batch(self):
+        """The next meta-validation batch (BatchData on the device)."""
+        if self.meta_loader is None and getattr(self, "meta_indexes", None) is None:
+            raise RuntimeError("no meta-validation set (loss_weights.meta_valid)")
+        if self._meta_iter is None:
+            loader = torch.utils.data.DataLoader(
+                self.meta_data,
+                batch_sampler=self._meta_batches(self._meta_position),
+                num_workers=self.meta_workers,
+                collate_fn=BatchData.collate,
+                # its own generator: creating the iterator must not draw from the
+                # global RNG (training dropout and other code use it)
+                generator=torch.Generator().manual_seed(self.meta_seed),
+            )
+            self._meta_iter = iter(loader)
+        batch = next(self._meta_iter)
+        self._meta_position += 1
+        return self.to_device(batch)
+
+    def to_device(self, batch):
+        """A BatchData with every tensor on the trainer's device."""
+        return dataclasses.replace(
+            batch,
+            **{
+                f.name: getattr(batch, f.name).to(self.device, non_blocking=True)
+                for f in dataclasses.fields(batch)
+                if torch.is_tensor(getattr(batch, f.name))
+            },
+        )
+
+    def trainable_params(self):
+        """The parameters the optimizer steps on (schedule-free in train mode: the
+        y iterate, where gradients are taken)."""
+        return [p for p in self.model.parameters() if p.requires_grad]
+
+    def forward(self, batch, *, rng_seed: int, grad: bool = False, di: int = 0):
+        """Model coverage predictions for ``batch`` under the training autocast, in
+        training mode (batch-stat BatchNorm, dropout) without touching BatchNorm
+        running stats (``track_running_stats`` is off for the call), with the
+        dropout RNG seeded by ``rng_seed`` (identical masks for identical seeds) and
+        the global RNG state left untouched."""
+        batch = self.to_device(batch)
+        hi = di if self.model_heads is None else self.model_heads
+        norms = [
+            m
+            for m in self.model.modules()
+            if isinstance(m, torch.nn.modules.batchnorm._BatchNorm)
+            and m.track_running_stats
+        ]
+        devices = [torch.cuda.current_device()] if self.device == "cuda" else []
+        try:
+            for m in norms:
+                m.track_running_stats = False
+            with torch.random.fork_rng(devices=devices):
+                torch.manual_seed(rng_seed)
+                with (
+                    torch.set_grad_enabled(grad),
+                    torch.autocast(device_type=self.device, dtype=self.mix_dtype),
+                ):
+                    x = batch.sequence
+                    if self.mix_dtype == torch.float32:
+                        x = x.float()  # no autocast: match the parameters' dtype
+                    yh = self.model(
+                        x,
+                        hi,
+                        di=self.model_di,
+                        gene_out_mask=batch.gene_out_mask,
+                        gene_presence=batch.gene_presence,
+                    ).coverage
+        finally:
+            for m in norms:
+                m.track_running_stats = True
+        return yh
+
+    def loss_from_pred(self, y_pred, batch, class_weights=None, di: int = 0):
+        """The training loss for ``y_pred`` (same normalizers, target, position, bin
+        and sample weights, plus lambda * L_dev when on), with bin weights looked up
+        from ``class_weights`` (default: the current table), which may require grad."""
+        batch = self.to_device(batch)
+        y = batch.coverage_targets.float()
+        bin_w = sample_w = None
+        if self.class_weights[di] is not None:
+            cw = self.class_weights[di] if class_weights is None else class_weights
+            labels = batch.bin_labels.long()
+            tg = self.track_groups[di]
+            bin_w = cw[labels, 0] if tg is None else cw[:, tg][labels].permute(0, 2, 1)
+        if self.sample_weights[di] is not None:
+            sample_w = self.sample_weights[di][batch.seq_index]
+        with torch.autocast(device_type=self.device, dtype=self.mix_dtype):
+            loss = self.loss_fn(
+                y_pred,
+                y,
+                self.target_weights[di],
+                bin_weights=bin_w,
+                sample_weights=sample_w,
+            )
+            if self.dev_loss is not None and batch.unit_mask is not None:
+                loss = loss + self.dev_lambda * self.dev_loss(
+                    y_pred, y, batch.unit_mask
+                )
+        return loss
+
+    def val_objective(self, y_pred, batch, di: int = 0):
+        """L_pmn with uniform weights + meta_valid.dev_lambda * L_dev."""
+        batch = self.to_device(batch)
+        y = batch.coverage_targets.float()
+        with torch.autocast(device_type=self.device, dtype=self.mix_dtype):
+            loss = self.loss_fn(y_pred, y, self.target_weights[di])
+            if self.meta_dev_lambda > 0:
+                loss = loss + self.meta_dev_lambda * self.dev_module(
+                    y_pred, y, batch.unit_mask
+                )
+        return loss
+
+    def perturb_params(self, direction, scale: float):
+        """Add ``scale * direction`` to the trainable parameters in place, keeping an
+        exact copy for ``restore_params`` (nested calls restore the first state)."""
+        params = self.trainable_params()
+        with torch.no_grad():
+            if self._param_backup is None:
+                self._param_backup = [p.detach().clone() for p in params]
+            for p, d in zip(params, direction):
+                p.add_(d.to(p.dtype), alpha=scale)
+
+    def restore_params(self):
+        """Restore the parameters saved by the first ``perturb_params`` exactly."""
+        if self._param_backup is None:
+            return
+        with torch.no_grad():
+            for p, saved in zip(self.trainable_params(), self._param_backup):
+                p.copy_(saved)
+        self._param_backup = None
+
+    def optimizer_second_moments(self):
+        """Adam's ``exp_avg_sq`` per trainable parameter (None where missing)."""
+        state = self.optimizer.state
+        return [state.get(p, {}).get("exp_avg_sq") for p in self.trainable_params()]
+
+    def log_hook_update(self, row: dict, name: str = "online_weights.tsv"):
+        """Append one row (a dict of scalars / short strings) to a TSV in out_dir."""
+        path = f"{self.out_dir}/{name}"
+        new = not os.path.exists(path)
+        with open(path, "a") as f:
+            if new:
+                f.write("\t".join(row) + "\n")
+            f.write("\t".join(str(v) for v in row.values()) + "\n")
+
+    def _log_meta_loss(self, ei):
+        """Per-epoch loss on the meta-validation windows (eval mode)."""
+        if getattr(self, "meta_indexes", None) is None:
+            return
+        total = obj = 0.0
+        n = 0
+        with torch.no_grad():
+            for i in range(0, len(self.meta_indexes), self.meta_batch_size):
+                items = [
+                    self.meta_data[int(j)]
+                    for j in self.meta_indexes[i : i + self.meta_batch_size]
+                ]
+                batch = self.to_device(BatchData.collate(items))
+                with torch.autocast(device_type=self.device, dtype=self.mix_dtype):
+                    yh = self.model_eval(batch.sequence, 0, di=self.model_di).coverage
+                y = batch.coverage_targets.float()
+                total += float(self.loss_fn(yh, y, self.target_weights[0])) * len(items)
+                obj += float(self.val_objective(yh, batch)) * len(items)
+                n += len(items)
+        self.log_hook_update(
+            {"epoch": ei, "meta_loss_pmn": total / n, "meta_val_objective": obj / n},
+            "meta_valid.tsv",
+        )
 
     def _batch_loss_weights(self, di, batch_data):
         """(bin_labels, bin_weights, sample_weights) on the device; None where unset."""
@@ -471,6 +699,22 @@ class Trainer:
             seq_index = batch_data.seq_index.to(self.device, non_blocking=True)
             sample_w = self.sample_weights[di][seq_index]
         return labels, bin_w, sample_w
+
+    def _has_loss_weights(self):
+        return any(w is not None for w in self.class_weights + self.sample_weights)
+
+    def _online_state(self):
+        """Loss weights, hook state, step and meta-loader position, saved with the
+        model in checkpoint.pth (one atomic file) and restored on resume."""
+        state = {
+            "class_weights": self.class_weights,
+            "sample_weights": self.sample_weights,
+            "step": self._step,
+            "meta_position": getattr(self, "_meta_position", 0),
+        }
+        if self.hook is not None and hasattr(self.hook, "state_dict"):
+            state["hook_state"] = self.hook.state_dict()
+        return state
 
     def _weights_state_file(self):
         return f"{self.out_dir}/loss_weights_state.pt"
@@ -701,6 +945,7 @@ class Trainer:
                     self._validate_mlm()
                 else:
                     n_eval_datasets = self._validate_cov(ei)
+                    self._log_meta_loss(ei)
             gc.collect()
 
             # log, select the best model, checkpoint
@@ -842,11 +1087,23 @@ class Trainer:
             epoch_start = checkpoint["epoch"]
             unimproved = 0 if self.reset_unimproved else checkpoint["unimproved"]
 
-        # restore online-updated loss weights, or let the hook initialize them
-        if epoch_start > 0 and os.path.exists(self._weights_state_file()):
-            state = torch.load(self._weights_state_file(), map_location=self.device)
-            self.class_weights = state["class_weights"]
-            self.sample_weights = state["sample_weights"]
+        # restore online state (weights, hook, step, meta position) saved with the
+        # checkpoint; older checkpoints fall back to loss_weights_state.pt
+        state = None
+        if epoch_start > 0:
+            if "class_weights" in checkpoint:
+                state = checkpoint
+            elif os.path.exists(self._weights_state_file()):
+                state = torch.load(self._weights_state_file(), map_location=self.device)
+        if state is not None:
+            to_dev = lambda ws: [None if w is None else w.to(self.device) for w in ws]  # noqa: E731
+            self.class_weights = to_dev(state["class_weights"])
+            self.sample_weights = to_dev(state["sample_weights"])
+            self._step = int(state.get("step", self._step))
+            self._meta_position = int(state.get("meta_position", 0))
+            self._meta_iter = None
+            if "hook_state" in state and hasattr(self.hook, "load_state_dict"):
+                self.hook.load_state_dict(state["hook_state"])
         elif self.hook is not None and hasattr(self.hook, "on_train_start"):
             self.hook.on_train_start(self)
         return epoch_start, valid_best, unimproved
@@ -1328,10 +1585,14 @@ class Trainer:
                     "scheduler": self.scheduler.state_dict(),
                     "valid_best": valid_best,
                     "unimproved": unimproved,
+                    **self._online_state(),
                 },
                 tmp_file,
             )
             os.replace(tmp_file, checkpoint_file)
+            if self._has_loss_weights():
+                # readable copy; resume reads the weights from checkpoint.pth
+                torch.save(self._online_state(), self._weights_state_file())
 
             # tiny progress marker — lets an orchestrator read the current
             # epoch without downloading the full checkpoint
@@ -1460,14 +1721,6 @@ class Trainer:
             self._dev_sums = [0.0, 0.0, 0]
         if self.hook is not None and hasattr(self.hook, "on_epoch_end"):
             self.hook.on_epoch_end(self, ei)
-        if any(w is not None for w in self.class_weights + self.sample_weights):
-            torch.save(
-                {
-                    "class_weights": self.class_weights,
-                    "sample_weights": self.sample_weights,
-                },
-                self._weights_state_file(),
-            )
 
     def _train_epoch_batches(self, ei):
         train_batch_i = 0
@@ -1480,6 +1733,14 @@ class Trainer:
             desc="Training",
             disable=self.log_progress,
         ):
+            if (
+                self.hook is not None
+                and hasattr(self.hook, "before_step")
+                and not self.is_mlm
+            ):
+                # weights changed here apply to this batch; hook gradients are dropped
+                self.hook.before_step(self, batch_data, di_tensor[0].item())
+                self.restore_params()
             self.optimizer.zero_grad()
             if self.is_mlm:
                 loss = self._train_batch_mlm(batch_data)

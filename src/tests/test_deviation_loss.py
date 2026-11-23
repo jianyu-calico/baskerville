@@ -293,3 +293,24 @@ def test_deviation_loss_refuses_several_data_dirs(rna_data, tmp_path):
                 str(rna_data),
             ]
         )
+
+
+def test_per_assay_pseudocount_and_threshold():
+    targets = pd.DataFrame(
+        {"identifier": [f"t{i}" for i in range(6)], "assay": ["rna"] * 3 + ["cage"] * 3}
+    )
+    cells = pd.DataFrame(
+        {"identifier": targets.identifier, "cell_type_group": list("xyzxyz")}
+    )
+    groups = assay_groups(targets, cells, ["rna", "cage"])
+    loss = DeviationLoss(
+        groups, torch.ones(BINS), pseudocount=[0.1, 0.01], threshold=[2.0, 0.05]
+    )
+    assert loss.pseudocounts == [0.1, 0.01] and loss.thresholds == [2.0, 0.05]
+    yhat, y, mask = rand_batch(B=1, T=6)
+    s_true, has_unit = loss.block_sums(y[:, 3:], mask)
+    w = loss.unit_weights(s_true, has_unit, 1)
+    assert torch.allclose(w, torch.clamp(s_true.mean(1) / 0.05, max=1.0) * has_unit)
+    assert torch.isfinite(loss(yhat, y, mask))
+    with pytest.raises(ValueError, match="one positive threshold per assay"):
+        DeviationLoss(groups, torch.ones(BINS), threshold=[1.0])

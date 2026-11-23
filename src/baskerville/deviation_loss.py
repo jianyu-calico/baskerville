@@ -85,6 +85,14 @@ def assay_groups(
     return out
 
 
+def per_assay(value, n: int, name: str) -> list[float]:
+    """A scalar or one value per assay -> a list of n positive floats."""
+    values = [float(value)] * n if np.isscalar(value) else [float(v) for v in value]
+    if len(values) != n or min(values) <= 0:
+        raise ValueError(f"deviation loss: need one positive {name} per assay")
+    return values
+
+
 def deviation_from_logs(u, uhat, group_means, weights):
     """sum_k w_k mean_g (dhat_gk - d_gk)^2 for log-unit values (B, T_a, K)."""
     U = torch.einsum("btk,tg->bgk", u, group_means)
@@ -101,7 +109,9 @@ class DeviationLoss(torch.nn.Module):
     Args:
       groups: per-assay track groups (``assay_groups``).
       position_weights: (L,) centre-vs-edge weights of the main loss.
-      block_bins, pseudocount, threshold: unit size, c, and the w_k threshold.
+      block_bins: unit size in bins.
+      pseudocount, threshold: c and the w_k threshold, per assay (a scalar applies to
+        every assay); target scales differ a lot between assays.
       denominators: per assay, the fixed average per-window sum of w_k on training
         windows (a scalar applies to every assay).
     """
@@ -122,13 +132,9 @@ class DeviationLoss(torch.nn.Module):
             )
         self.groups = groups
         self.block_bins = block_bins
-        self.pseudocount = pseudocount
-        self.threshold = threshold
-        if np.isscalar(denominators):
-            denominators = [float(denominators)] * len(groups)
-        if len(denominators) != len(groups) or min(denominators) <= 0:
-            raise ValueError("deviation loss: need one positive denominator per assay")
-        self.denominators = [float(d) for d in denominators]
+        self.pseudocounts = per_assay(pseudocount, len(groups), "pseudocount")
+        self.thresholds = per_assay(threshold, len(groups), "threshold")
+        self.denominators = per_assay(denominators, len(groups), "denominator")
         block_pw = position_weights.reshape(-1, block_bins).mean(dim=1)
         self.register_buffer("block_position_weights", block_pw.float())
         for i, g in enumerate(groups):
@@ -143,10 +149,13 @@ class DeviationLoss(torch.nn.Module):
         has_unit = m.reshape(B, -1, self.block_bins).sum(dim=-1) > 0
         return sums.sum(dim=-1), has_unit
 
-    def unit_weights(self, target_sums, has_unit):
-        """w_k from targets only: min(1, E_k / threshold) x block position weight."""
+    def unit_weights(self, target_sums, has_unit, i=0):
+        """w_k from targets only: min(1, E_k / threshold_i) x block position weight."""
         expr = target_sums.mean(dim=1)
-        w = torch.clamp(expr / self.threshold, max=1.0) * self.block_position_weights
+        w = (
+            torch.clamp(expr / self.thresholds[i], max=1.0)
+            * self.block_position_weights
+        )
         return (w * has_unit).detach()
 
     def forward(self, y_pred, y_true, unit_mask):
@@ -160,9 +169,10 @@ class DeviationLoss(torch.nn.Module):
             tracks = getattr(self, f"tracks_{i}")
             s_true, has_unit = self.block_sums(y_true[:, tracks], unit_mask)
             s_pred, _ = self.block_sums(y_pred[:, tracks], unit_mask)
-            w = self.unit_weights(s_true, has_unit)
-            u = torch.log(s_true + self.pseudocount)
-            uhat = torch.log(s_pred + self.pseudocount)
+            w = self.unit_weights(s_true, has_unit, i)
+            c = self.pseudocounts[i]
+            u = torch.log(s_true + c)
+            uhat = torch.log(s_pred + c)
             dev = deviation_from_logs(u, uhat, getattr(self, f"group_means_{i}"), w)
             terms.append(dev / (self.denominators[i] * y_true.shape[0]))
         return torch.stack(terms).mean()
@@ -173,5 +183,5 @@ class DeviationLoss(torch.nn.Module):
         for i in range(len(self.groups)):
             tracks = getattr(self, f"tracks_{i}")
             s_true, has_unit = self.block_sums(y_true.float()[:, tracks], unit_mask)
-            out.append(self.unit_weights(s_true, has_unit).sum(dim=1))
+            out.append(self.unit_weights(s_true, has_unit, i).sum(dim=1))
         return torch.stack(out, dim=1)

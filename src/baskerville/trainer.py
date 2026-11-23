@@ -384,8 +384,9 @@ class Trainer:
         """``params["deviation_loss"]`` -> ``self.dev_loss`` (None when off or lambda 0).
 
         Keys: lambda, cell_types (TSV keyed by identifier), group_column, assays,
-        block_bins, pseudocount, threshold, denominators (per assay; estimated from
-        ``denominator_windows`` training windows when omitted). The train dataset
+        block_bins, and per assay (scalar or list) pseudocount, threshold and
+        denominators (estimated from ``denominator_windows`` training windows when
+        omitted). The train dataset
         must carry a unit map (hound_train builds it from ``unit_classes``).
         """
         config = self.params.get("deviation_loss", {}) or {}
@@ -415,17 +416,17 @@ class Trainer:
             groups,
             pw_loss.position_weights.flatten(),
             block_bins=int(config.get("block_bins", 4)),
-            pseudocount=float(config.get("pseudocount", 0.1)),
-            threshold=float(config.get("threshold", 1.0)),
+            pseudocount=config.get("pseudocount", 0.1),
+            threshold=config.get("threshold", 1.0),
         ).to(self.device)
         denominators = config.get("denominators")
         if denominators is None:
             denominators = self._estimate_dev_denominators(
                 ds, int(config.get("denominator_windows", 32))
             )
-        self.dev_loss.denominators = [float(d) for d in np.atleast_1d(denominators)]
-        if len(self.dev_loss.denominators) != len(groups):
-            raise ValueError("deviation loss: need one denominator per assay")
+        self.dev_loss.denominators = deviation_loss.per_assay(
+            denominators, len(groups), "denominator"
+        )
         with open(f"{self.out_dir}/deviation_loss_setup.json", "w") as f:
             json.dump(
                 {
@@ -433,6 +434,8 @@ class Trainer:
                     "assays": [g.assay for g in groups],
                     "tracks": [len(g.tracks) for g in groups],
                     "groups": [g.group_names for g in groups],
+                    "pseudocounts": self.dev_loss.pseudocounts,
+                    "thresholds": self.dev_loss.thresholds,
                     "denominators": self.dev_loss.denominators,
                 },
                 f,

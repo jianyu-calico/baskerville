@@ -384,10 +384,14 @@ class Trainer:
         """``params["deviation_loss"]`` -> ``self.dev_loss`` (None when off or lambda 0).
 
         Keys: lambda, cell_types (TSV keyed by identifier), group_column, assays,
-        block_bins, and per assay (scalar or list) pseudocount, threshold and
-        denominators (estimated from ``denominator_windows`` training windows when
-        omitted). The train dataset
-        must carry a unit map (hound_train builds it from ``unit_classes``).
+        space ("transformed" or "untransformed"), block_bins, and per assay (scalar
+        or list) pseudocount, threshold and denominators. Set ``denominators`` in the
+        config (``deviation_loss.estimate_denominators``, >= 500 training windows) so
+        all seeds share them; when omitted they are estimated at start from
+        ``denominator_windows`` (512) training windows sampled independently of the
+        training seed (with ``--whole``, the train dataset spans all splits). The
+        train dataset must carry a unit map (hound_train builds it from
+        ``bin_classes`` / ``unit_classes``).
         """
         config = self.params.get("deviation_loss", {}) or {}
         self.dev_lambda = float(config.get("lambda", 0.0))
@@ -418,12 +422,18 @@ class Trainer:
             block_bins=int(config.get("block_bins", 4)),
             pseudocount=config.get("pseudocount", 0.1),
             threshold=config.get("threshold", 1.0),
+            space=config.get("space", "transformed"),
         ).to(self.device)
         denominators = config.get("denominators")
-        if denominators is None:
-            denominators = self._estimate_dev_denominators(
-                ds, int(config.get("denominator_windows", 32))
+        estimated = denominators is None
+        if estimated:
+            n = int(config.get("denominator_windows", 512))
+            print(
+                f"deviation loss: estimating denominators from {n} training windows; "
+                "put them in the config to skip this",
+                flush=True,
             )
+            denominators = deviation_loss.estimate_denominators(self.dev_loss, ds, n)
         self.dev_loss.denominators = deviation_loss.per_assay(
             denominators, len(groups), "denominator"
         )
@@ -431,31 +441,19 @@ class Trainer:
             json.dump(
                 {
                     "lambda": self.dev_lambda,
+                    "space": self.dev_loss.space,
                     "assays": [g.assay for g in groups],
                     "tracks": [len(g.tracks) for g in groups],
+                    "samples": [g.sample_sums.shape[1] for g in groups],
                     "groups": [g.group_names for g in groups],
                     "pseudocounts": self.dev_loss.pseudocounts,
                     "thresholds": self.dev_loss.thresholds,
                     "denominators": self.dev_loss.denominators,
+                    "denominators_estimated": estimated,
                 },
                 f,
                 indent=2,
             )
-
-    def _estimate_dev_denominators(self, ds, n_windows):
-        """Average per-window sum of w_k over a seeded sample of training windows."""
-        rng = np.random.default_rng([self.seed or 0, 12345])
-        idx = rng.choice(len(ds), size=min(n_windows, len(ds)), replace=False)
-        sums = []
-        for i in idx:
-            item = ds[(int(i), 0, False)] if ds.mode == "train" else ds[int(i)]
-            y = item.coverage_targets.float()[None].to(self.device)
-            mask = item.unit_mask[None].to(self.device)
-            sums.append(self.dev_loss.unit_weight_sums(y, mask).cpu())
-        mean = torch.cat(sums).mean(dim=0)
-        if (mean <= 0).any():
-            raise ValueError("deviation loss: no weighted units in the sampled windows")
-        return mean.tolist()
 
     def _batch_loss_weights(self, di, batch_data):
         """(bin_labels, bin_weights, sample_weights) on the device; None where unset."""

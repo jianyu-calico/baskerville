@@ -12,6 +12,7 @@ from baskerville.deviation_loss import (
     DeviationLoss,
     assay_groups,
     deviation_from_logs,
+    untransform,
 )
 from baskerville.loss_weights import RegionClassMap
 from baskerville.scripts import hound_train
@@ -314,3 +315,196 @@ def test_per_assay_pseudocount_and_threshold():
     assert torch.isfinite(loss(yhat, y, mask))
     with pytest.raises(ValueError, match="one positive threshold per assay"):
         DeviationLoss(groups, torch.ones(BINS), threshold=[1.0])
+
+
+# -- follow-up to the independent check (2026-11-23) ---------------------------
+
+
+def reference_ldev(
+    yhat, y, mask, tracks_assay, samples, groups, pw, block, c, thr, D, space_fn=None
+):
+    """Plain numpy L_dev, written independently of the module.
+
+    samples: list of track-index lists (strand pairs summed); groups: cell type per sample.
+    """
+    yhat, y, mask, pw = (np.asarray(a, dtype=np.float64) for a in (yhat, y, mask, pw))
+    if space_fn is not None:
+        y, yhat = space_fn(y), space_fn(yhat)
+    B, _, L = y.shape
+    K = L // block
+    names = sorted(set(groups))
+    total = 0.0
+    for b in range(B):
+        for k in range(K):
+            sl = slice(k * block, (k + 1) * block)
+            m = mask[b, sl]
+            if not m.any():
+                continue
+            st = np.array([sum((y[b, t, sl] * m).sum() for t in s) for s in samples])
+            sp = np.array([sum((yhat[b, t, sl] * m).sum() for t in s) for s in samples])
+            w = min(1.0, st.mean() / thr) * pw[sl].mean()
+            U = np.array(
+                [
+                    np.log(st[[i for i, g in enumerate(groups) if g == n]] + c).mean()
+                    for n in names
+                ]
+            )
+            Uh = np.array(
+                [
+                    np.log(sp[[i for i, g in enumerate(groups) if g == n]] + c).mean()
+                    for n in names
+                ]
+            )
+            total += w * (((Uh - Uh.mean()) - (U - U.mean())) ** 2).mean()
+    return total / (D * B)
+
+
+def toy_targets():
+    """6 RNA tracks: t0/t1 a strand pair (liver), t2 liver, t3 brain, t4/t5 blood."""
+    return (
+        pd.DataFrame(
+            {
+                "identifier": [f"t{i}" for i in range(6)],
+                "assay": ["rna"] * 6,
+                "scale": [0.3, 0.3, 1.5, 30.0, 1.5, 0.3],
+                "clip_soft": [384.0, 384.0, 384.0, 4.0, 384.0, 384.0],
+                "sum_stat": ["sum_sqrt"] * 6,
+            }
+        ),
+        pd.DataFrame(
+            {
+                "identifier": [f"t{i}" for i in range(6)],
+                "cell_type_group": [
+                    "liver",
+                    "liver",
+                    "liver",
+                    "brain",
+                    "blood",
+                    "blood",
+                ],
+            }
+        ),
+        np.array([1, 0, 2, 3, 4, 5]),
+    )
+
+
+@pytest.mark.parametrize("space", ["transformed", "untransformed"])
+def test_matches_independent_reference(space):
+    """Catches w_k from predictions, dropped position weights, unsummed strands."""
+    targets, cells, sp = toy_targets()
+    (g,) = assay_groups(targets, cells, ["rna"], sp)
+    assert g.sample_sums.shape == (6, 5)  # t0+t1 one sample
+    L, block = 32, 4
+    pw = torch.linspace(0.1, 1.0, L)
+    gen = torch.Generator().manual_seed(3)
+    y = torch.rand(2, 6, L, generator=gen) * 6
+    yhat = torch.rand(2, 6, L, generator=gen) * 6
+    mask = torch.rand(2, L, generator=gen) > 0.4
+    c, thr, D = 0.2, 4.0, 3.0  # threshold binds for some units
+    loss = DeviationLoss(
+        [g],
+        pw,
+        block_bins=block,
+        pseudocount=c,
+        threshold=thr,
+        denominators=D,
+        space=space,
+    )
+    sc, cs = (
+        targets.scale.to_numpy()[None, :, None],
+        targets.clip_soft.to_numpy()[None, :, None],
+    )
+
+    def untr(v):
+        v = np.where(v > cs, cs - 1 + (v - cs + 1) ** 2, v)
+        return ((v + 1) ** 2 - 1) / sc
+
+    ref = reference_ldev(
+        yhat,
+        y,
+        mask,
+        None,
+        [[0, 1], [2], [3], [4], [5]],
+        ["liver", "liver", "brain", "blood", "blood"],
+        pw,
+        block,
+        c,
+        thr,
+        D,
+        untr if space == "untransformed" else None,
+    )
+    assert np.isclose(float(loss(yhat, y, mask)), ref, rtol=1e-5)
+    # the weights must come from targets: swapping in other predictions changes L but not w
+    w1 = loss.unit_weights(*loss.sample_unit_sums(y, mask, 0), 0)
+    assert torch.equal(w1, loss.unit_weights(*loss.sample_unit_sums(y, mask, 0), 0))
+
+
+def test_strand_partners_are_summed_before_the_log():
+    targets, cells, sp = toy_targets()
+    (g,) = assay_groups(targets, cells, ["rna"], sp)
+    loss = DeviationLoss([g], torch.ones(BINS), threshold=1.0)
+    yhat, y, mask = rand_batch(B=1, T=6)
+    base = loss(yhat, y, mask)
+    # moving signal between the two strands of one library changes nothing
+    y2, yhat2 = y.clone(), yhat.clone()
+    y2[:, 0], y2[:, 1] = y[:, 0] + 0.7 * y[:, 1], 0.3 * y[:, 1]
+    yhat2[:, 0], yhat2[:, 1] = yhat[:, 1], yhat[:, 0]
+    assert torch.allclose(loss(yhat2, y2, mask), base, rtol=1e-6)
+
+
+def test_untransform_matches_baskerville():
+    from baskerville.dataset import untransform_preds
+
+    targets, cells, sp = toy_targets()
+    (g,) = assay_groups(targets, cells, ["rna"], sp)
+    y = torch.rand(6, 40) * 8
+    ours = untransform(y[None], g.scale, g.clip_soft, g.sqrt)[0]
+    theirs = untransform_preds(y.clone().double(), targets, unscale=True).float()
+    assert torch.allclose(ours, theirs, rtol=1e-5)
+    targets.loc[0, "sum_stat"] = "sum_exp75"
+    (g2,) = assay_groups(targets, cells, ["rna"], sp)
+    with pytest.raises(ValueError, match="can't untransform"):
+        DeviationLoss([g2], torch.ones(BINS), space="untransformed")
+
+
+def test_validation_is_unchanged_with_lambda_positive(rna_data, tmp_path, monkeypatch):
+    """L_dev is computed for training batches only; validation uses the plain loss."""
+    calls = {"n": 0}
+    orig = DeviationLoss.forward
+
+    def counting(self, *args):
+        calls["n"] += 1
+        return orig(self, *args)
+
+    monkeypatch.setattr(DeviationLoss, "forward", counting)
+    out = run(tmp_path, rna_data, "val", dev_params(tmp_path, rna_data, 0.5, epochs=1))
+    # 4 training windows, batch 2 -> 2 training steps; validation (4 windows) adds none
+    assert calls["n"] == 2
+    log = pd.read_csv(out / "deviation_loss.tsv", sep="\t")
+    assert len(log) == 1
+
+
+def test_denominators_do_not_depend_on_the_training_seed(rna_data, tmp_path):
+    outs = []
+    for seed in (1, 2):
+        params = dev_params(tmp_path, rna_data, 0.5, epochs=1)
+        params["train"]["seed"] = seed
+        params["train"]["deviation_loss"]["denominator_windows"] = 3
+        outs.append(
+            json.loads(
+                (
+                    run(tmp_path, rna_data, f"s{seed}", params)
+                    / "deviation_loss_setup.json"
+                ).read_text()
+            )
+        )
+    assert outs[0]["denominators"] == outs[1]["denominators"]
+    assert outs[0]["denominators_estimated"] is True
+    params = dev_params(tmp_path, rna_data, 0.5, epochs=1)
+    params["train"]["deviation_loss"]["denominators"] = [7.5]
+    setup = json.loads(
+        (
+            run(tmp_path, rna_data, "fixed", params) / "deviation_loss_setup.json"
+        ).read_text()
+    )
+    assert setup["denominators"] == [7.5] and setup["denominators_estimated"] is False

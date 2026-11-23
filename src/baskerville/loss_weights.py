@@ -81,33 +81,7 @@ class RegionClassMap:
         names = table["class"].tolist()
         index = {n: i for i, n in enumerate(names)}
 
-        bed = pd.read_csv(
-            bin_classes,
-            sep="\t",
-            header=None,
-            usecols=[0, 1, 2, 3],
-            names=["chrom", "start", "end", "class"],
-            dtype={"chrom": str, "class": str},
-            comment="#",
-        )
-        missing = set(bed["class"]) - set(index)
-        if missing:
-            raise ValueError(
-                f"classes in {bin_classes} missing from {class_weights}: {sorted(missing)[:10]}"
-            )
-        intervals = {}
-        for chrom, d in bed.groupby("chrom", sort=False):
-            d = d.sort_values("start")
-            starts = d["start"].to_numpy(np.int64)
-            ends = d["end"].to_numpy(np.int64)
-            if (ends <= starts).any():
-                raise ValueError(
-                    f"{bin_classes}: empty or negative interval on {chrom}"
-                )
-            if (starts[1:] < ends[:-1]).any():
-                raise ValueError(f"{bin_classes}: overlapping intervals on {chrom}")
-            ids = d["class"].map(index).to_numpy(np.int16)
-            intervals[chrom] = (starts, ends, ids)
+        intervals = read_class_intervals(bin_classes, index, class_weights)
 
         default = None
         if default_class is not None:
@@ -117,6 +91,21 @@ class RegionClassMap:
                 )
             default = index[default_class]
         return cls(names, weights, group_names, default, intervals)
+
+    @classmethod
+    def unit_map(cls, bin_classes: str | Path, unit_classes) -> RegionClassMap:
+        """A map labelling bins 1..n for ``unit_classes`` and 0 ("other") elsewhere.
+
+        Only the rows of those classes are read, so a genome-wide class BED stays small.
+        """
+        names = ["other", *unit_classes]
+        index = {n: i for i, n in enumerate(names)}
+        intervals = read_class_intervals(bin_classes, index, keep=set(unit_classes))
+        if not intervals:
+            raise ValueError(
+                f"{bin_classes} has no intervals of classes {unit_classes}"
+            )
+        return cls(names, np.ones((len(names), 1)), [None], 0, intervals)
 
     @property
     def num_groups(self) -> int:
@@ -187,6 +176,39 @@ class RegionClassMap:
                 )
             labels[uncovered] = self.default_class
         return labels
+
+
+def read_class_intervals(
+    bin_classes, index: dict, weights_file=None, keep=None
+) -> dict:
+    """Class BED -> {chrom: (sorted starts, ends, class ids)}; ``keep`` limits classes."""
+    bed = pd.read_csv(
+        bin_classes,
+        sep="\t",
+        header=None,
+        usecols=[0, 1, 2, 3],
+        names=["chrom", "start", "end", "class"],
+        dtype={"chrom": str, "class": str},
+        comment="#",
+    )
+    if keep is not None:
+        bed = bed[bed["class"].isin(keep)]
+    missing = set(bed["class"]) - set(index)
+    if missing:
+        raise ValueError(
+            f"classes in {bin_classes} missing from {weights_file}: {sorted(missing)[:10]}"
+        )
+    intervals = {}
+    for chrom, d in bed.groupby("chrom", sort=False):
+        d = d.sort_values("start")
+        starts = d["start"].to_numpy(np.int64)
+        ends = d["end"].to_numpy(np.int64)
+        if (ends <= starts).any():
+            raise ValueError(f"{bin_classes}: empty or negative interval on {chrom}")
+        if (starts[1:] < ends[:-1]).any():
+            raise ValueError(f"{bin_classes}: overlapping intervals on {chrom}")
+        intervals[chrom] = (starts, ends, d["class"].map(index).to_numpy(np.int16))
+    return intervals
 
 
 def normalize_class_weights(weights: np.ndarray, bin_counts: np.ndarray) -> np.ndarray:

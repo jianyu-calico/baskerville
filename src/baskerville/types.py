@@ -57,6 +57,8 @@ class BatchData:
             unless the dataset maps examples to sequences.bed.
         bin_labels: Region-class id per output bin, shape (target_length,) or
             (B, target_length), for loss weighting. None if not loaded.
+        unit_mask: Bins of the deviation-loss unit classes, bool, shape like
+            bin_labels. None if not loaded.
     """
 
     sequence: torch.Tensor
@@ -69,6 +71,7 @@ class BatchData:
     repeat_mask: Optional[torch.Tensor] = None
     seq_index: Optional[torch.Tensor] = None
     bin_labels: Optional[torch.Tensor] = None
+    unit_mask: Optional[torch.Tensor] = None
 
     @property
     def has_coverage(self) -> bool:
@@ -146,6 +149,11 @@ class BatchData:
             bin_labels=(
                 torch.stack([b.bin_labels for b in batch])
                 if batch[0].bin_labels is not None
+                else None
+            ),
+            unit_mask=(
+                torch.stack([b.unit_mask for b in batch])
+                if batch[0].unit_mask is not None
                 else None
             ),
         )

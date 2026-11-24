@@ -638,3 +638,41 @@ def test_init_model_does_not_override_a_checkpoint(tmp_path, data_dir):
     p["train"]["init_model"] = str(other / "model_best.pth")
     resumed = run(tmp_path, data_dir, "b", p)  # out_dir has a checkpoint: resume wins
     assert same(model_state(plain), model_state(resumed))
+
+
+def test_resume_loads_the_checkpoint_on_the_cpu(tmp_path, data_dir, monkeypatch):
+    """A checkpoint saved on a GPU must resume anywhere: torch.load maps to the CPU."""
+    run(
+        tmp_path,
+        data_dir,
+        "cpu_resume",
+        params_for(tmp_path, data_dir, meta=False, epochs=1),
+    )
+    calls = []
+    orig = torch.load
+
+    def recording(path, *args, **kwargs):
+        calls.append((str(path), kwargs.get("map_location")))
+        return orig(path, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "load", recording)
+    run(
+        tmp_path,
+        data_dir,
+        "cpu_resume",
+        params_for(tmp_path, data_dir, meta=False, epochs=2),
+    )
+    ck = [m for p, m in calls if p.endswith("checkpoint.pth")]
+    assert ck and all(m == "cpu" for m in ck)
+
+
+def test_require_cuda_fails_fast_without_a_gpu(tmp_path, data_dir, monkeypatch):
+    monkeypatch.setenv("BASKERVILLE_REQUIRE_CUDA", "1")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(RuntimeError, match="no CUDA device"):
+        run(
+            tmp_path,
+            data_dir,
+            "nocuda",
+            params_for(tmp_path, data_dir, meta=False, epochs=1),
+        )

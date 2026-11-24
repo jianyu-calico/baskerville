@@ -135,7 +135,15 @@ class Trainer:
         if self.num_eval_workers is None:
             self.num_eval_workers = self.num_workers
 
-        # device
+        # device; a job launched for a GPU fails at once on a pod without one
+        if (
+            os.environ.get("BASKERVILLE_REQUIRE_CUDA") == "1"
+            and not torch.cuda.is_available()
+        ):
+            raise RuntimeError(
+                "BASKERVILLE_REQUIRE_CUDA=1 but no CUDA device is available; "
+                "refusing to train on the CPU"
+            )
         if torch.cuda.is_available():
             self.device = "cuda"
             pin_mem = self.params.get("pin_mem", True)
@@ -1115,7 +1123,11 @@ class Trainer:
         valid_best = -np.inf
         unimproved = 0
         if os.path.exists(f"{self.out_dir}/checkpoint.pth"):
-            checkpoint = torch.load(f"{self.out_dir}/checkpoint.pth")
+            # on the CPU first: a resume must not depend on the device it was saved on
+            # (load_state_dict moves model and optimizer tensors to their parameters)
+            checkpoint = torch.load(
+                f"{self.out_dir}/checkpoint.pth", map_location="cpu"
+            )
             self.model.load_state_dict(checkpoint["model"])
             self.optimizer.load_state_dict(checkpoint["optimizer"])
             if self.schedule == "cosine":
